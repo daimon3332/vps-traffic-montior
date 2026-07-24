@@ -4,7 +4,7 @@
 #   bash <(curl -fsSL https://raw.githubusercontent.com/<owner>/<repo>/main/vps-traffic-monitor.sh)
 #   ./vps-traffic-monitor.sh
 #   ./vps-traffic-monitor.sh --check
-sh_v="1.2.1"
+sh_v="1.2.2"
 
 # ── colors (linux-tools-daimon style) ──────────────────────────────
 gl_hui='\e[37m'
@@ -1020,7 +1020,7 @@ install_local() {
   chmod +x "$VTM_SCRIPT_PATH"
   write_default_config
   if is_root; then
-    ln -sfn "$VTM_SCRIPT_PATH" "$VTM_BIN_LINK" 2>/dev/null || true
+    install_bin_entry
   fi
   load_config 2>/dev/null || true
   setup_shell_shortcut "${MENU_KEY:-m}"
@@ -1028,43 +1028,103 @@ install_local() {
   echo "  脚本: $VTM_SCRIPT_PATH"
   echo "  配置: $VTM_CONFIG"
   echo "  状态: $VTM_STATE"
-  [ -L "$VTM_BIN_LINK" ] && echo "  命令: vtm"
-  echo "  快捷键: 输入 ${MENU_KEY:-m} 回车打开菜单（新开终端生效）"
+  echo "  命令: vtm  /  快捷键: ${MENU_KEY:-m}"
 }
 
-# 在 ~/.bashrc 写入 alias，默认 m
+# 把脚本复制为 /usr/local/bin/vtm 实体文件（kejilion 同款，避免软链自复制）
+install_bin_entry() {
+  is_root || return 1
+  [ -f "$VTM_SCRIPT_PATH" ] || return 1
+  rm -f "$VTM_BIN_LINK"
+  cp -f "$VTM_SCRIPT_PATH" "$VTM_BIN_LINK"
+  chmod +x "$VTM_BIN_LINK"
+  ln -sfn "$VTM_BIN_LINK" /usr/bin/vtm 2>/dev/null || true
+}
+
+# 快捷键安装方式对齐 kejilion「k」：
+#   /usr/local/bin/<key> 可执行文件 + /usr/bin/<key> 软链
+# 不依赖 alias / source bashrc，任意 shell 立即可用
+remove_old_shortcuts() {
+  local old="$1"
+  # 清理曾写过的 bashrc alias 块
+  local f
+  for f in "$HOME/.bashrc" "$HOME/.profile" "$HOME/.bash_profile" "$HOME/.zshrc"; do
+    [ -f "$f" ] || continue
+    if grep -q 'vps-traffic-monitor shortcut' "$f" 2>/dev/null; then
+      local tmp
+      tmp=$(mktemp)
+      awk '
+        /# >>> vps-traffic-monitor shortcut >>>/ {skip=1; next}
+        /# <<< vps-traffic-monitor shortcut <<</ {skip=0; next}
+        !skip {print}
+      ' "$f" >"$tmp"
+      mv -f "$tmp" "$f"
+    fi
+    sed -i "/^alias ${old}=/d" "$f" 2>/dev/null || true
+  done
+  # 清理指向本程序的旧命令名软链（保留 vtm 主入口）
+  if [ -n "$old" ] && [ "$old" != "vtm" ]; then
+    for f in "/usr/local/bin/$old" "/usr/bin/$old"; do
+      if [ -L "$f" ]; then
+        local tgt
+        tgt=$(readlink -f "$f" 2>/dev/null || true)
+        case "$tgt" in
+          "$VTM_SCRIPT_PATH"|"$VTM_BIN_LINK"|*/vps-traffic-monitor.sh) rm -f "$f" ;;
+        esac
+      elif [ -f "$f" ] && grep -q 'VTM_NAME="vps-traffic-monitor"' "$f" 2>/dev/null; then
+        rm -f "$f"
+      fi
+    done
+  fi
+}
+
 setup_shell_shortcut() {
   local key="${1:-m}"
-  local rc_file bash_line
-  # 只允许安全的单段标识符
+  local old="${MENU_KEY:-m}"
   if ! [[ "$key" =~ ^[A-Za-z][A-Za-z0-9_-]*$ ]]; then
-    err "快捷键只能是字母开头的标识符，例如 m / vtm / mon"
+    err "快捷键只能是字母开头，例如 m / vtm / mon"
     return 1
   fi
-  rc_file="${HOME}/.bashrc"
-  [ -f "$rc_file" ] || touch "$rc_file"
-  # 去掉旧的 vtm 快捷键块
-  if grep -q '# >>> vps-traffic-monitor shortcut >>>' "$rc_file" 2>/dev/null; then
-    local tmp
-    tmp=$(mktemp)
-    awk '
-      /# >>> vps-traffic-monitor shortcut >>>/ {skip=1; next}
-      /# <<< vps-traffic-monitor shortcut <<</ {skip=0; next}
-      !skip {print}
-    ' "$rc_file" >"$tmp"
-    mv -f "$tmp" "$rc_file"
+  if [ "$(id -u)" -ne 0 ]; then
+    err "设置 PATH 快捷键需要 root（写入 /usr/local/bin）"
+    return 1
   fi
-  bash_line="alias ${key}='bash ${VTM_SCRIPT_PATH}'"
-  {
-    echo ""
-    echo "# >>> vps-traffic-monitor shortcut >>>"
-    echo "$bash_line"
-    echo "# <<< vps-traffic-monitor shortcut <<<"
-  } >>"$rc_file"
+
+  ensure_dirs
+  if [ ! -f "$VTM_SCRIPT_PATH" ]; then
+    local src
+    src=$(resolve_self_source)
+    if [ -n "$src" ] && [ -f "$src" ]; then
+      cp -f "$src" "$VTM_SCRIPT_PATH"
+    elif [ -n "${BASH_SOURCE[0]:-}" ] && [ -r "${BASH_SOURCE[0]}" ]; then
+      cat "${BASH_SOURCE[0]}" >"$VTM_SCRIPT_PATH"
+    fi
+  fi
+  chmod +x "$VTM_SCRIPT_PATH" 2>/dev/null || true
+  install_bin_entry
+
+  if [ -n "$old" ] && [ "$old" != "$key" ]; then
+    remove_old_shortcuts "$old"
+  fi
+  remove_old_shortcuts "$key"
+
+  # 与 kejilion 相同：/usr/local/bin/m + /usr/bin/m
+  if [ "$key" != "vtm" ]; then
+    ln -sfn "$VTM_BIN_LINK" "/usr/local/bin/$key"
+    ln -sfn "$VTM_BIN_LINK" "/usr/bin/$key" 2>/dev/null || true
+  fi
+
   set_config_kv MENU_KEY "$key"
   MENU_KEY="$key"
-  ok "快捷键已设为: ${key}  （执行 source ~/.bashrc 或重开终端后生效）"
-  log "shortcut set to $key"
+  hash -r 2>/dev/null || true
+  ok "快捷键已安装: 直接输入 ${key} 回车（等同 kejilion 的 k）"
+  echo "  /usr/local/bin/${key}  ->  $VTM_BIN_LINK"
+  if command -v "$key" >/dev/null 2>&1; then
+    echo "  检测: $(command -v "$key")"
+  else
+    warn "当前 shell 未刷新 PATH，执行 hash -r 或重开终端"
+  fi
+  log "shortcut PATH set to $key"
   return 0
 }
 
@@ -1088,19 +1148,24 @@ update_script() {
   mv -f "$tmp" "$VTM_SCRIPT_PATH"
   chmod +x "$VTM_SCRIPT_PATH"
   if is_root; then
-    ln -sfn "$VTM_SCRIPT_PATH" "$VTM_BIN_LINK" 2>/dev/null || true
+    install_bin_entry
+    load_config 2>/dev/null || true
+    local key="${MENU_KEY:-m}"
+    if [ "$key" != "vtm" ]; then
+      ln -sfn "$VTM_BIN_LINK" "/usr/local/bin/$key"
+      ln -sfn "$VTM_BIN_LINK" "/usr/bin/$key" 2>/dev/null || true
+    fi
   fi
   ok "脚本已更新 → v${new_ver:-?}  ($VTM_SCRIPT_PATH)"
   log "script updated to v${new_ver:-?} from $VTM_REPO_RAW"
 
-  # If current process is the installed script, re-exec new version into menu
   local self
   self=$(resolve_self_source)
   if [ -n "$self" ] && [ "$(readlink -f "$self" 2>/dev/null || echo "$self")" = "$(readlink -f "$VTM_SCRIPT_PATH" 2>/dev/null || echo "$VTM_SCRIPT_PATH")" ]; then
     info "正在用新版本重新启动菜单..."
     exec bash "$VTM_SCRIPT_PATH" --menu
   fi
-  info "下次运行将使用新版本。也可执行: bash $VTM_SCRIPT_PATH"
+  info "下次运行: ${MENU_KEY:-m}  或  vtm"
   return 0
 }
 
@@ -1188,7 +1253,7 @@ show_dashboard() {
   clear 2>/dev/null || true
   echo -e "${gl_kjlan}VPS 流量监控${gl_bai}  v${sh_v}"
   echo -e "主机: $(hostname 2>/dev/null)  网卡: ${IFACE_NOW:-?}  本月周期: ${CYCLE_ID:-?}"
-  echo -e "快捷键: 终端输入 ${gl_lv}${MENU_KEY:-m}${gl_bai} 回车即可打开本菜单"
+  echo -e "快捷键: 输入 ${gl_lv}${MENU_KEY:-m}${gl_bai} 回车（PATH 命令，类似 kejilion 的 k）"
   echo "------------------------"
   echo -e "${gl_kjlan}【本月流量】${gl_bai}"
   echo "  上行: $(bytes_to_human "${TX_USED:-0}")"
@@ -1471,8 +1536,14 @@ menu_change_shortcut() {
   clear 2>/dev/null || true
   echo -e "${gl_kjlan}改快捷键${gl_bai}"
   echo "------------------------"
-  echo "现在: 终端里输入 ${MENU_KEY:-m} 回车 → 打开本菜单"
-  echo "默认是 m，可以改成例如 vtm / mon"
+  echo "现在: 输入 ${MENU_KEY:-m} 回车 → 打开本菜单"
+  echo "实现方式: 安装到 /usr/local/bin/（与 kejilion 的 k 相同）"
+  echo "默认 m，可改成 mon 等"
+  if command -v "${MENU_KEY:-m}" >/dev/null 2>&1; then
+    echo "检测: $(command -v "${MENU_KEY:-m}")"
+  else
+    echo -e "${gl_huang}检测: 当前未在 PATH 中找到 ${MENU_KEY:-m}${gl_bai}"
+  fi
   echo "------------------------"
   local key
   read -r -p "新快捷键 [m]: " key
@@ -1481,14 +1552,28 @@ menu_change_shortcut() {
   press_any
 }
 
+ensure_shortcut_ready() {
+  load_config
+  local key="${MENU_KEY:-m}"
+  if is_root && [ -f "$VTM_SCRIPT_PATH" ]; then
+    # 实体文件缺失或与安装目录脚本不一致时重装
+    if [ ! -f "$VTM_BIN_LINK" ] || [ -L "$VTM_BIN_LINK" ] \
+      || ! cmp -s "$VTM_SCRIPT_PATH" "$VTM_BIN_LINK" 2>/dev/null; then
+      install_bin_entry || true
+    fi
+  fi
+  if ! command -v "$key" >/dev/null 2>&1; then
+    setup_shell_shortcut "$key" || true
+  elif [ ! -e "/usr/local/bin/$key" ] && [ "$key" != "vtm" ]; then
+    setup_shell_shortcut "$key" || true
+  fi
+}
+
 main_menu() {
   ensure_dirs
   write_default_config
   load_config
-  # 首次进入确保有默认快捷键
-  if [ ! -f "$HOME/.bashrc" ] || ! grep -q 'vps-traffic-monitor shortcut' "$HOME/.bashrc" 2>/dev/null; then
-    setup_shell_shortcut "${MENU_KEY:-m}" >/dev/null 2>&1 || true
-  fi
+  ensure_shortcut_ready
   while true; do
     show_dashboard
     local c

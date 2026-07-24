@@ -9,7 +9,9 @@ Linux VPS 流量监控（纯 Bash 数字菜单）。
 bash <(curl -fsSL https://raw.githubusercontent.com/daimon3332/vps-traffic-montior/main/vps-traffic-monitor.sh)
 ```
 
-安装后终端输入 **`m` 回车** 打开菜单（可在菜单里改快捷键）。
+安装后终端输入 **`m` 回车** 打开菜单（与 [kejilion](https://github.com/kejilion/sh) 的 `k` 一样，装到 `/usr/local/bin/m`，不依赖 alias）。
+
+也可：`vtm`
 
 ## 主菜单
 
@@ -21,7 +23,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/daimon3332/vps-traffic-monti
 | 2 | 删除规则 |
 | 3 | 通知设置（Telegram / 邮件，测试成功才保存） |
 | 4 | **后台监控**开关（开启后自动定时检查，不必一直开菜单） |
-| 5 | 改快捷键（默认 `m`） |
+| 5 | 改快捷键（默认 `m`，写入 `/usr/local/bin`） |
 | 6 | 更新脚本 |
 | 0 | 退出 |
 
