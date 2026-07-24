@@ -1003,11 +1003,12 @@ install_local() {
   local src
   src=$(resolve_self_source)
   if [ -n "$src" ] && [ -f "$src" ]; then
-    cp -f "$src" "$VTM_SCRIPT_PATH"
+    if [ "$(readlink -f "$src" 2>/dev/null || echo "$src")" != "$(readlink -f "$VTM_SCRIPT_PATH" 2>/dev/null || echo "$VTM_SCRIPT_PATH")" ]; then
+      cp -f "$src" "$VTM_SCRIPT_PATH"
+    fi
   elif [ -n "${BASH_SOURCE[0]:-}" ] && [ -r "${BASH_SOURCE[0]}" ]; then
     # bash <(curl ...) 场景：从 /dev/fd 落盘
-    cp -f "${BASH_SOURCE[0]}" "$VTM_SCRIPT_PATH" 2>/dev/null \
-      || cat "${BASH_SOURCE[0]}" >"$VTM_SCRIPT_PATH"
+    cat "${BASH_SOURCE[0]}" >"$VTM_SCRIPT_PATH"
   elif [ -f "$VTM_SCRIPT_PATH" ]; then
     ok "使用已有脚本: $VTM_SCRIPT_PATH"
   else
