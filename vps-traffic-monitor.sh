@@ -4,7 +4,7 @@
 #   bash <(curl -fsSL https://raw.githubusercontent.com/<owner>/<repo>/main/vps-traffic-monitor.sh)
 #   ./vps-traffic-monitor.sh
 #   ./vps-traffic-monitor.sh --check
-sh_v="1.1.0"
+sh_v="1.2.0"
 
 # ── colors (linux-tools-daimon style) ──────────────────────────────
 gl_hui='\e[37m'
@@ -56,6 +56,8 @@ SHUTDOWN_DELAY=30
 ADDRESS_STOP_CMD="/root/address/app/ops/stop.sh"
 DRY_RUN=0
 CHECK_INTERVAL_MIN=5
+# 终端快捷键，默认 m（输入 m 回车打开本菜单）
+MENU_KEY="m"
 
 # rules: name|threshold|metric|actions
 declare -a RULE_LINES=()
@@ -448,6 +450,7 @@ SHUTDOWN_DELAY=30
 ADDRESS_STOP_CMD="/root/address/app/ops/stop.sh"
 DRY_RUN=0
 CHECK_INTERVAL_MIN=5
+MENU_KEY="m"
 EOF
 }
 
@@ -486,7 +489,7 @@ load_config() {
   # Source only safe scalar keys (no RULE_/CMD_ — values may contain | )
   local tmp_src
   tmp_src=$(mktemp)
-  grep -E '^(INSTANCE_NAME|INTERFACE|METRIC|RESET_DAY|TIMEZONE|QUOTA|TG_|MAIL_|SHUTDOWN_|ADDRESS_|DRY_RUN|CHECK_INTERVAL)' \
+  grep -E '^(INSTANCE_NAME|INTERFACE|METRIC|RESET_DAY|TIMEZONE|QUOTA|TG_|MAIL_|SHUTDOWN_|ADDRESS_|DRY_RUN|CHECK_INTERVAL|MENU_KEY)' \
     "$VTM_CONFIG" 2>/dev/null | grep -vE '^\s*#' >"$tmp_src" || true
   # shellcheck disable=SC1090
   source "$tmp_src" 2>/dev/null || true
@@ -505,6 +508,7 @@ load_config() {
   ADDRESS_STOP_CMD=${ADDRESS_STOP_CMD:-/root/address/app/ops/stop.sh}
   DRY_RUN=${DRY_RUN:-0}
   CHECK_INTERVAL_MIN=${CHECK_INTERVAL_MIN:-5}
+  MENU_KEY=${MENU_KEY:-m}
   TG_ENDPOINT=${TG_ENDPOINT:-https://api.telegram.org/bot}
 
   local line key val name
@@ -999,11 +1003,50 @@ install_local() {
   if is_root; then
     ln -sfn "$VTM_SCRIPT_PATH" "$VTM_BIN_LINK" 2>/dev/null || true
   fi
+  load_config 2>/dev/null || true
+  setup_shell_shortcut "${MENU_KEY:-m}"
   ok "已安装到 $VTM_ROOT"
   echo "  脚本: $VTM_SCRIPT_PATH"
   echo "  配置: $VTM_CONFIG"
   echo "  状态: $VTM_STATE"
   [ -L "$VTM_BIN_LINK" ] && echo "  命令: vtm"
+  echo "  快捷键: 输入 ${MENU_KEY:-m} 回车打开菜单（新开终端生效）"
+}
+
+# 在 ~/.bashrc 写入 alias，默认 m
+setup_shell_shortcut() {
+  local key="${1:-m}"
+  local rc_file bash_line
+  # 只允许安全的单段标识符
+  if ! [[ "$key" =~ ^[A-Za-z][A-Za-z0-9_-]*$ ]]; then
+    err "快捷键只能是字母开头的标识符，例如 m / vtm / mon"
+    return 1
+  fi
+  rc_file="${HOME}/.bashrc"
+  [ -f "$rc_file" ] || touch "$rc_file"
+  # 去掉旧的 vtm 快捷键块
+  if grep -q '# >>> vps-traffic-monitor shortcut >>>' "$rc_file" 2>/dev/null; then
+    local tmp
+    tmp=$(mktemp)
+    awk '
+      /# >>> vps-traffic-monitor shortcut >>>/ {skip=1; next}
+      /# <<< vps-traffic-monitor shortcut <<</ {skip=0; next}
+      !skip {print}
+    ' "$rc_file" >"$tmp"
+    mv -f "$tmp" "$rc_file"
+  fi
+  bash_line="alias ${key}='bash ${VTM_SCRIPT_PATH}'"
+  {
+    echo ""
+    echo "# >>> vps-traffic-monitor shortcut >>>"
+    echo "$bash_line"
+    echo "# <<< vps-traffic-monitor shortcut <<<"
+  } >>"$rc_file"
+  set_config_kv MENU_KEY "$key"
+  MENU_KEY="$key"
+  ok "快捷键已设为: ${key}  （执行 source ~/.bashrc 或重开终端后生效）"
+  log "shortcut set to $key"
+  return 0
 }
 
 # Download latest script from GitHub (main), keep config/state.
@@ -1110,13 +1153,6 @@ show_dashboard() {
   load_config
   refresh_usage 2>/dev/null || true
 
-  local qh="未设" pct="n/a" qbytes=0
-  if [ -n "$QUOTA" ]; then
-    qbytes=$(parse_size "$QUOTA")
-    qh=$(bytes_to_human "$qbytes")
-    pct=$(pct_of "${BILL_USED:-0}" "$qbytes")
-  fi
-
   local tg_s mail_s timer_s
   if [ "$TG_ENABLED" = "1" ] && [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
     tg_s="已开启"
@@ -1132,24 +1168,20 @@ show_dashboard() {
 
   clear 2>/dev/null || true
   echo -e "${gl_kjlan}VPS 流量监控${gl_bai}  v${sh_v}"
-  echo -e "主机: $(hostname 2>/dev/null)  网卡: ${IFACE_NOW:-?}  周期: ${CYCLE_ID:-?} (每月${RESET_DAY}日重置)"
+  echo -e "主机: $(hostname 2>/dev/null)  网卡: ${IFACE_NOW:-?}  本月周期: ${CYCLE_ID:-?}"
+  echo -e "快捷键: 终端输入 ${gl_lv}${MENU_KEY:-m}${gl_bai} 回车即可打开本菜单"
   echo "------------------------"
   echo -e "${gl_kjlan}【本月流量】${gl_bai}"
   echo "  上行: $(bytes_to_human "${TX_USED:-0}")"
   echo "  下行: $(bytes_to_human "${RX_USED:-0}")"
   echo "  合计: $(bytes_to_human "${SUM_USED:-0}")"
-  [ -n "$QUOTA" ] && echo "  配额参考: ${qh} (默认计量 ${pct}%)"
-  if [ "$DRY_RUN" = "1" ]; then
-    echo -e "  ${gl_huang}模拟模式 dry-run：触发时不真正停服/关机${gl_bai}"
-  fi
   echo "------------------------"
   echo -e "${gl_kjlan}【通知】${gl_bai} Telegram:${tg_s}  邮件:${mail_s}"
-  echo -e "${gl_kjlan}【定时检查】${gl_bai} ${timer_s} (每 ${CHECK_INTERVAL_MIN} 分钟)"
-  echo -e "${gl_kjlan}【终止动作】${gl_bai} 停address / 关机（规则里可选，通知始终发送）"
+  echo -e "${gl_kjlan}【后台监控】${gl_bai} ${timer_s}"
   echo "------------------------"
-  echo -e "${gl_kjlan}【规则】${gl_bai}"
+  echo -e "${gl_kjlan}【规则】${gl_bai}  达到阈值 → 一定通知；可选再停 address / 关机"
   if [ "${#RULE_LINES[@]}" -eq 0 ]; then
-    echo -e "  ${gl_hui}(还没有规则，选 [3] 添加)${gl_bai}"
+    echo -e "  ${gl_hui}(还没有规则，选 1 添加)${gl_bai}"
   else
     local line name th m acts flag used thb i=1
     for line in "${RULE_LINES[@]}"; do
@@ -1169,14 +1201,12 @@ show_dashboard() {
     done
   fi
   echo "------------------------"
-  echo -e "${gl_lv}1.${gl_bai} 刷新"
-  echo -e "${gl_lv}2.${gl_bai} 立即检查一次"
-  echo -e "${gl_lv}3.${gl_bai} 添加规则"
-  echo -e "${gl_lv}4.${gl_bai} 删除规则"
-  echo -e "${gl_lv}5.${gl_bai} 通知设置 / 测试"
-  echo -e "${gl_lv}6.${gl_bai} 开启或关闭定时检查"
-  echo -e "${gl_lv}7.${gl_bai} 简单设置（配额/重置日/模拟模式等）"
-  echo -e "${gl_lv}8.${gl_bai} 更新脚本"
+  echo -e "${gl_lv}1.${gl_bai} 添加规则"
+  echo -e "${gl_lv}2.${gl_bai} 删除规则"
+  echo -e "${gl_lv}3.${gl_bai} 通知设置（Telegram / 邮件）"
+  echo -e "${gl_lv}4.${gl_bai} 后台监控开关（开机自动检查）"
+  echo -e "${gl_lv}5.${gl_bai} 改快捷键（当前: ${MENU_KEY:-m}）"
+  echo -e "${gl_lv}6.${gl_bai} 更新脚本"
   echo -e "${gl_lv}0.${gl_bai} 退出"
   echo "------------------------"
 }
@@ -1394,15 +1424,17 @@ menu_notify() {
   done
 }
 
-menu_timer_simple() {
+menu_background() {
+  load_config
   clear 2>/dev/null || true
-  echo -e "${gl_kjlan}定时检查${gl_bai}"
+  echo -e "${gl_kjlan}后台监控${gl_bai}"
   echo "------------------------"
-  echo "状态: $(timer_status_line)"
-  echo "间隔: ${CHECK_INTERVAL_MIN:-5} 分钟（在「简单设置」可改）"
+  echo "说明: 开启后系统会每隔几分钟自动检查流量和规则，"
+  echo "      不用一直开着本菜单。关掉就不再自动检查。"
+  echo "当前: $(timer_status_line)"
   echo "------------------------"
-  echo "1. 开启定时检查（systemd）"
-  echo "2. 关闭定时检查"
+  echo "1. 开启后台监控"
+  echo "2. 关闭后台监控"
   echo "0. 返回"
   echo "------------------------"
   local c
@@ -1415,79 +1447,40 @@ menu_timer_simple() {
   esac
 }
 
-menu_simple_settings() {
+menu_change_shortcut() {
   load_config
   clear 2>/dev/null || true
-  echo -e "${gl_kjlan}简单设置${gl_bai}"
+  echo -e "${gl_kjlan}改快捷键${gl_bai}"
   echo "------------------------"
-  echo "当前:"
-  echo "  实例名: $INSTANCE_NAME"
-  echo "  网卡: ${INTERFACE:-自动}"
-  echo "  月重置日: $RESET_DAY"
-  echo "  时区: $TIMEZONE"
-  echo "  配额展示: ${QUOTA:-未设}"
-  echo "  检查间隔: ${CHECK_INTERVAL_MIN} 分钟"
-  echo "  模拟模式 dry-run: $DRY_RUN  (1=只演练不真正停服/关机)"
-  echo "  address 停止脚本: $ADDRESS_STOP_CMD"
-  echo "  关机延迟秒: $SHUTDOWN_DELAY"
+  echo "现在: 终端里输入 ${MENU_KEY:-m} 回车 → 打开本菜单"
+  echo "默认是 m，可以改成例如 vtm / mon"
   echo "------------------------"
-  local v
-  read -r -p "实例名 (回车跳过): " v; [ -n "$v" ] && set_config_kv INSTANCE_NAME "$v"
-  read -r -p "网卡 (空=自动, 输入 auto 恢复自动): " v
-  if [ "$v" = "auto" ]; then set_config_kv INTERFACE ""
-  elif [ -n "$v" ]; then set_config_kv INTERFACE "$v"; fi
-  read -r -p "月重置日 1-28 (回车跳过): " v; [ -n "$v" ] && set_config_kv RESET_DAY "$v"
-  read -r -p "时区 (回车跳过): " v; [ -n "$v" ] && set_config_kv TIMEZONE "$v"
-  read -r -p "配额展示 如 10T (回车跳过): " v; [ -n "$v" ] && set_config_kv QUOTA "$v"
-  read -r -p "检查间隔分钟 (回车跳过): " v; [ -n "$v" ] && set_config_kv CHECK_INTERVAL_MIN "$v"
-  read -r -p "模拟模式 1开0关 (回车跳过): " v; [ -n "$v" ] && set_config_kv DRY_RUN "$v"
-  read -r -p "address 停止脚本路径 (回车跳过): " v; [ -n "$v" ] && set_config_kv ADDRESS_STOP_CMD "$v"
-  read -r -p "关机延迟秒 (回车跳过): " v; [ -n "$v" ] && set_config_kv SHUTDOWN_DELAY "$v"
-  if confirm_yes "重置本月流量统计基准? (一般不用)"; then
-    if confirm_YES "输入 YES 确认重置"; then
-      local iface rx tx
-      iface=$(get_iface)
-      read -r rx tx <<<"$(read_counters "$iface")"
-      CYCLE_ID=$(current_cycle_id)
-      BASE_RX=$rx; BASE_TX=$tx; LAST_RX=$rx; LAST_TX=$tx; ACC_RX=0; ACC_TX=0
-      save_state
-      clear_fired
-      CYCLE_ID=$(current_cycle_id)
-      BASE_RX=$rx; BASE_TX=$tx; LAST_RX=$rx; LAST_TX=$tx; ACC_RX=0; ACC_TX=0
-      save_state
-      ok "已重置周期基准"
-    fi
-  fi
-  ok "已保存。若改了检查间隔，请到菜单 6 重新开启定时检查"
+  local key
+  read -r -p "新快捷键 [m]: " key
+  key=${key:-m}
+  setup_shell_shortcut "$key"
   press_any
 }
 
 main_menu() {
   ensure_dirs
   write_default_config
+  load_config
+  # 首次进入确保有默认快捷键
+  if [ ! -f "$HOME/.bashrc" ] || ! grep -q 'vps-traffic-monitor shortcut' "$HOME/.bashrc" 2>/dev/null; then
+    setup_shell_shortcut "${MENU_KEY:-m}" >/dev/null 2>&1 || true
+  fi
   while true; do
     show_dashboard
     local c
     read -r -p "请输入数字: " c
     case "$c" in
-      1) continue ;;
-      2)
-        info "执行检查..."
-        check_rules
-        ok "检查完成"
-        echo ""
-        build_status_text
-        press_any
-        ;;
-      3) wizard_add_rule ;;
-      4) wizard_delete_rule ;;
-      5) menu_notify ;;
+      1) wizard_add_rule ;;
+      2) wizard_delete_rule ;;
+      3) menu_notify ;;
+      4) menu_background ;;
+      5) menu_change_shortcut ;;
       6)
-        load_config
-        menu_timer_simple
-        ;;
-      7) menu_simple_settings ;;
-      8)
         if confirm_yes "从 GitHub 更新脚本（保留本机配置）?"; then
           update_script
         fi

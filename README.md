@@ -1,7 +1,7 @@
 # VPS Traffic Monitor
 
-通用 Linux VPS 流量监控（纯 Bash + 数字菜单）。  
-到阈值时**一定发通知**；可选再**停 address**、**关机**（可都不选 / 只选一个 / 两个都选）。
+Linux VPS 流量监控（纯 Bash 数字菜单）。  
+**到阈值一定发通知**；可选再 **停 address**、**关机**。
 
 ## 一键运行
 
@@ -9,68 +9,58 @@
 bash <(curl -fsSL https://raw.githubusercontent.com/daimon3332/vps-traffic-montior/main/vps-traffic-monitor.sh)
 ```
 
-## 主菜单（尽量简单）
+安装后终端输入 **`m` 回车** 打开菜单（可在菜单里改快捷键）。
 
-启动后先看本月上行 / 下行 / 合计、通知与规则状态。
+## 主菜单
 
-| 数字 | 做什么 |
-|------|--------|
-| 1 | 刷新 |
-| 2 | 立即检查一次 |
-| 3 | **添加规则**（向导） |
-| 4 | 删除规则 |
-| 5 | 通知设置 / 测试 |
-| 6 | 开启或关闭定时检查 |
-| 7 | 简单设置（配额、重置日、模拟模式等） |
-| 8 | 更新脚本 |
+启动即显示本月上行 / 下行 / 合计、通知与规则。
+
+| 数字 | 作用 |
+|------|------|
+| 1 | **添加规则**（名称 → 上行/下行/合计 → 阈值 → 是否停 address / 关机） |
+| 2 | 删除规则 |
+| 3 | 通知设置（Telegram / 邮件，测试成功才保存） |
+| 4 | **后台监控**开关（开启后自动定时检查，不必一直开菜单） |
+| 5 | 改快捷键（默认 `m`） |
+| 6 | 更新脚本 |
 | 0 | 退出 |
 
-### 添加规则向导（菜单 3）
+### 这几项分别干什么？
 
-1. 输入**规则名称**  
-2. 选流量方向：**上行 / 下行 / 双向合计**  
-3. 输入阈值，如 `6.5T`  
-4. 问是否**停 address**、是否**关机**（都可答 N，只通知）  
-5. 确认后保存  
+| 你要做的事 | 用哪个 |
+|------------|--------|
+| 规定「用到多少流量就通知 / 停服 / 关机」 | **1 添加规则** |
+| 配机器人、邮箱，让通知能发出去 | **3 通知设置** |
+| 让机器自己在后台盯着，不用人一直开着脚本 | **4 后台监控** |
 
-触发时**始终通知**；额外动作按你的选择执行。
+没有「配额 / 重置日 / 模拟模式」一堆高级项；每月按自然月统计，默认足够用。
 
-### 通知（菜单 5）
+### 添加规则示例（Oracle 出站）
 
-- 配置 Telegram / 邮件时会**先发测试，成功才保存**  
-- 也可单独测试 Telegram / 邮件  
-
-## 典型：Oracle 出站 10T
-
-1. 菜单 5 配好 Telegram 或邮件  
-2. 菜单 3 加两条规则：  
-   - 名称 `stop-app`，上行，`6.5T`，停 address=Y，关机=N  
-   - 名称 `poweroff`，上行，`8T`，停 address=N，关机=Y  
-3. 菜单 7 可把「模拟模式」先设为 `1` 试跑，确认后改 `0`  
-4. 菜单 6 开启定时检查  
+1. 名称 `stop-app` → 上行 → `6.5T` → 停 address=Y，关机=N  
+2. 名称 `poweroff` → 上行 → `8T` → 停 address=N，关机=Y  
+3. 菜单 3 配好通知  
+4. 菜单 4 开启后台监控  
 
 ## 命令行
 
 ```text
---check            静默检查（给 timer）
---status           看流量
---test-telegram    测 Telegram
---test-email       测邮件
---test-notify      测已开启通道
---install          安装到 /root/vps-traffic-monitor/
---update           更新脚本
---install-timer    开定时
---uninstall-timer  关定时
+m                        # 装好后的快捷键（可改）
+bash 脚本路径            # 打开菜单
+--check                  # 静默检查（给后台 timer）
+--status
+--test-telegram / --test-email / --test-notify
+--install / --update
+--install-timer / --uninstall-timer
 ```
 
-## 配置路径
+## 路径
 
-- 配置：`/root/vps-traffic-monitor/config.conf`  
-- 状态：`/var/lib/vps-traffic-monitor/state`  
-- 日志：`/var/log/vps-traffic-monitor.log`  
-- address 停止脚本默认：`/root/address/app/ops/stop.sh`（菜单 7 可改）
+- 配置：`/root/vps-traffic-monitor/config.conf`
+- 状态：`/var/lib/vps-traffic-monitor/state`
+- 日志：`/var/log/vps-traffic-monitor.log`
+- 停 address：`/root/address/app/ops/stop.sh`
 
 ## 安全
 
-- 停服 / 关机有破坏性，建议先开模拟模式（dry-run=1）  
-- 不要把含 token 的 `config.conf` 提交到 Git  
+停服 / 关机有破坏性；含 token 的配置不要提交 Git。
