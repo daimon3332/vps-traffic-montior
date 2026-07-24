@@ -4,7 +4,7 @@
 #   bash <(curl -fsSL https://raw.githubusercontent.com/<owner>/<repo>/main/vps-traffic-monitor.sh)
 #   ./vps-traffic-monitor.sh
 #   ./vps-traffic-monitor.sh --check
-sh_v="1.2.0"
+sh_v="1.2.1"
 
 # ── colors (linux-tools-daimon style) ──────────────────────────────
 gl_hui='\e[37m'
@@ -83,18 +83,37 @@ press_any() {
   read -n 1 -s -r _ || true
 }
 
+# y/Y/yes 为是；n/N/no 或空为否
+is_yes() {
+  local a
+  a=$(echo "${1:-}" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+  case "$a" in
+    y|yes) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+is_no() {
+  local a
+  a=$(echo "${1:-}" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+  case "$a" in
+    n|no|"") return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 confirm_yes() {
   local prompt="${1:-确认?}"
   local ans
   read -r -p "$prompt [y/N]: " ans
-  [[ "$ans" =~ ^[Yy]$ ]]
+  is_yes "$ans"
 }
 
 confirm_YES() {
   local prompt="${1:-危险操作，输入 YES 确认}"
   local ans
   read -r -p "$prompt: " ans
-  [ "$ans" = "YES" ]
+  is_yes "$ans"
 }
 
 ensure_dirs() {
@@ -1253,10 +1272,10 @@ wizard_add_rule() {
   read -r -p "   达到后关机? [y/N]: " act_off
 
   acts="notify"
-  if [[ "$act_stop" =~ ^[Yy]$ ]]; then
+  if is_yes "$act_stop"; then
     acts="${acts},stop_address"
   fi
-  if [[ "$act_off" =~ ^[Yy]$ ]]; then
+  if is_yes "$act_off"; then
     acts="${acts},shutdown"
   fi
 
