@@ -1,0 +1,8 @@
+[Unit]
+Description=VPS Traffic Monitor one-shot check
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/root/vps-traffic-monitor/vps-traffic-monitor.sh --check
+Nice=10

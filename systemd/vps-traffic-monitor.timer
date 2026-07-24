@@ -1,0 +1,11 @@
+[Unit]
+Description=VPS Traffic Monitor periodic check
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Unit=vps-traffic-monitor.service
+
+[Install]
+WantedBy=timers.target
