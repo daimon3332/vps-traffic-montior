@@ -4,7 +4,7 @@
 #   bash <(curl -fsSL https://raw.githubusercontent.com/<owner>/<repo>/main/vps-traffic-monitor.sh)
 #   ./vps-traffic-monitor.sh
 #   ./vps-traffic-monitor.sh --check
-sh_v="1.0.0"
+sh_v="1.1.0"
 
 # ── colors (linux-tools-daimon style) ──────────────────────────────
 gl_hui='\e[37m'
@@ -52,10 +52,12 @@ MAIL_TO=""
 SHUTDOWN_ENABLED=1
 SHUTDOWN_CMD="/sbin/shutdown -h now"
 SHUTDOWN_DELAY=30
+# 固定终止动作：停止 address（路径可改）
+ADDRESS_STOP_CMD="/root/address/app/ops/stop.sh"
 DRY_RUN=0
 CHECK_INTERVAL_MIN=5
 
-# rules / commands stored as parallel arrays
+# rules: name|threshold|metric|actions
 declare -a RULE_LINES=()
 declare -A CMD_MAP=()
 
@@ -412,7 +414,7 @@ metric_label() {
 default_config_body() {
   cat <<'EOF'
 # VPS Traffic Monitor config
-# 多机通用：每台机器一份 config.conf
+# 建议用菜单添加规则，不必手改
 
 INSTANCE_NAME=""
 INTERFACE=""
@@ -421,14 +423,10 @@ RESET_DAY=1
 TIMEZONE="Asia/Shanghai"
 QUOTA="10T"
 
-# 规则格式: name|threshold|metric|actions
-# actions 逗号分隔: notify  run:命令名  shutdown
-# 示例（Oracle 出站）:
-# RULE_1="stop-app|6.5T|up|notify,run:stop_heavy_app"
+# 规则: name|阈值|方向(up/down/sum)|动作
+# 动作固定含 notify；可选 stop_address、shutdown
+# RULE_1="stop-app|6.5T|up|notify,stop_address"
 # RULE_2="poweroff|8T|up|notify,shutdown"
-
-# 命名命令（通用，按机器修改）
-# CMD_stop_heavy_app="/root/address/app/ops/stop.sh"
 
 TG_ENABLED=0
 TG_BOT_TOKEN=""
@@ -447,6 +445,7 @@ MAIL_TO=""
 SHUTDOWN_ENABLED=1
 SHUTDOWN_CMD="/sbin/shutdown -h now"
 SHUTDOWN_DELAY=30
+ADDRESS_STOP_CMD="/root/address/app/ops/stop.sh"
 DRY_RUN=0
 CHECK_INTERVAL_MIN=5
 EOF
@@ -487,7 +486,7 @@ load_config() {
   # Source only safe scalar keys (no RULE_/CMD_ — values may contain | )
   local tmp_src
   tmp_src=$(mktemp)
-  grep -E '^(INSTANCE_NAME|INTERFACE|METRIC|RESET_DAY|TIMEZONE|QUOTA|TG_|MAIL_|SHUTDOWN_|DRY_RUN|CHECK_INTERVAL)' \
+  grep -E '^(INSTANCE_NAME|INTERFACE|METRIC|RESET_DAY|TIMEZONE|QUOTA|TG_|MAIL_|SHUTDOWN_|ADDRESS_|DRY_RUN|CHECK_INTERVAL)' \
     "$VTM_CONFIG" 2>/dev/null | grep -vE '^\s*#' >"$tmp_src" || true
   # shellcheck disable=SC1090
   source "$tmp_src" 2>/dev/null || true
@@ -503,6 +502,7 @@ load_config() {
   MAIL_USE_SSL=${MAIL_USE_SSL:-1}
   SHUTDOWN_ENABLED=${SHUTDOWN_ENABLED:-1}
   SHUTDOWN_DELAY=${SHUTDOWN_DELAY:-30}
+  ADDRESS_STOP_CMD=${ADDRESS_STOP_CMD:-/root/address/app/ops/stop.sh}
   DRY_RUN=${DRY_RUN:-0}
   CHECK_INTERVAL_MIN=${CHECK_INTERVAL_MIN:-5}
   TG_ENDPOINT=${TG_ENDPOINT:-https://api.telegram.org/bot}
@@ -582,46 +582,48 @@ mask_secret() {
   fi
 }
 
+# Send Telegram using current TG_* globals (does not check TG_ENABLED).
 notify_telegram() {
   local title="$1" body="$2"
-  [ "$TG_ENABLED" = "1" ] || return 1
-  [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ] || return 1
-  local text
+  [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ] || {
+    err "Telegram 未配置 token/chat_id"
+    return 1
+  }
+  local text url resp
   text=$(printf '<b>%s</b>\n%s' "$title" "$body")
-  local url="${TG_ENDPOINT}${TG_BOT_TOKEN}/sendMessage"
-  local resp
+  url="${TG_ENDPOINT:-https://api.telegram.org/bot}${TG_BOT_TOKEN}/sendMessage"
   resp=$(curl -fsSL --connect-timeout 10 --max-time 30 \
     -d "chat_id=${TG_CHAT_ID}" \
     --data-urlencode "text=${text}" \
     -d "parse_mode=HTML" \
     "$url" 2>&1) || {
     log "telegram fail: $resp"
+    err "Telegram 请求失败: $resp"
     return 1
   }
-  echo "$resp" | grep -q '"ok":true' || echo "$resp" | grep -q '"ok": true' || {
-    log "telegram bad resp: $resp"
-    return 1
-  }
-  return 0
+  if echo "$resp" | grep -q '"ok":true\|"ok": true'; then
+    return 0
+  fi
+  log "telegram bad resp: $resp"
+  err "Telegram API 返回失败: $resp"
+  return 1
 }
 
+# Send email using current MAIL_* globals (does not check MAIL_ENABLED).
 notify_email() {
   local title="$1" body="$2"
-  [ "$MAIL_ENABLED" = "1" ] || return 1
-  [ -n "$MAIL_HOST" ] && [ -n "$MAIL_FROM" ] && [ -n "$MAIL_TO" ] || return 1
+  [ -n "$MAIL_HOST" ] && [ -n "$MAIL_FROM" ] && [ -n "$MAIL_TO" ] || {
+    err "邮件未配置 host/from/to"
+    return 1
+  }
 
-  # Prefer curl SMTP
   if command -v curl >/dev/null 2>&1; then
-    local proto="smtp"
-    local url
-    if [ "$MAIL_USE_SSL" = "1" ] && [ "$MAIL_PORT" = "465" ]; then
+    local url mailfile rcpt
+    if [ "${MAIL_USE_SSL:-1}" = "1" ] && [ "${MAIL_PORT:-465}" = "465" ]; then
       url="smtps://${MAIL_HOST}:${MAIL_PORT}"
-    elif [ "$MAIL_USE_SSL" = "1" ]; then
-      url="smtp://${MAIL_HOST}:${MAIL_PORT}"
     else
-      url="smtp://${MAIL_HOST}:${MAIL_PORT}"
+      url="smtp://${MAIL_HOST}:${MAIL_PORT:-465}"
     fi
-    local mailfile
     mailfile=$(mktemp)
     {
       echo "From: ${MAIL_FROM}"
@@ -634,13 +636,11 @@ notify_email() {
       echo "$body"
     } >"$mailfile"
 
-    local curl_args=( -fsSL --connect-timeout 15 --max-time 60
+    local curl_args=( -sS --connect-timeout 15 --max-time 60
       --url "$url"
       --mail-from "$MAIL_FROM"
       --upload-file "$mailfile"
     )
-    # multiple --mail-rcpt
-    local rcpt
     IFS=',' read -ra _rcpts <<<"$MAIL_TO"
     for rcpt in "${_rcpts[@]}"; do
       rcpt=$(echo "$rcpt" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
@@ -649,29 +649,62 @@ notify_email() {
     if [ -n "$MAIL_USER" ]; then
       curl_args+=( --user "${MAIL_USER}:${MAIL_PASS}" )
     fi
-    if [ "$MAIL_USE_SSL" = "1" ] && [ "$MAIL_PORT" != "465" ]; then
+    if [ "${MAIL_USE_SSL:-1}" = "1" ] && [ "${MAIL_PORT:-465}" != "465" ]; then
       curl_args+=( --ssl-reqd )
     fi
 
-    if curl "${curl_args[@]}" 2>>"$VTM_LOG"; then
+    local cerr
+    if cerr=$(curl "${curl_args[@]}" 2>&1); then
       rm -f "$mailfile"
       return 0
     fi
     rm -f "$mailfile"
-    log "email curl smtp failed"
+    log "email curl smtp failed: $cerr"
+    err "邮件发送失败: $cerr"
   fi
 
-  # fallback: sendmail
   if command -v sendmail >/dev/null 2>&1; then
-    {
+    if {
       echo "From: ${MAIL_FROM}"
       echo "To: ${MAIL_TO}"
       echo "Subject: ${title}"
       echo "Content-Type: text/plain; charset=UTF-8"
       echo ""
       echo "$body"
-    } | sendmail -t 2>>"$VTM_LOG" && return 0
+    } | sendmail -t 2>>"$VTM_LOG"; then
+      return 0
+    fi
   fi
+  return 1
+}
+
+test_telegram() {
+  local title="${1:-VPS Traffic Monitor · Telegram 测试}"
+  local body="${2:-}"
+  [ -n "$body" ] || body=$(build_status_text 2>/dev/null || echo "Telegram channel test")
+  info "正在测试 Telegram..."
+  if notify_telegram "$title" "$body"; then
+    ok "Telegram 测试成功"
+    log "telegram test ok"
+    return 0
+  fi
+  err "Telegram 测试失败，未写入配置"
+  log "telegram test fail"
+  return 1
+}
+
+test_email() {
+  local title="${1:-VPS Traffic Monitor · 邮件测试}"
+  local body="${2:-}"
+  [ -n "$body" ] || body=$(build_status_text 2>/dev/null || echo "Email channel test")
+  info "正在测试邮件..."
+  if notify_email "$title" "$body"; then
+    ok "邮件测试成功"
+    log "email test ok"
+    return 0
+  fi
+  err "邮件测试失败，未写入配置"
+  log "email test fail"
   return 1
 }
 
@@ -803,8 +836,10 @@ execute_actions() {
     a=$(echo "$a" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
     case "$a" in
       notify) ;;
+      stop_address|stop-address)
+        do_stop_address
+        ;;
       shutdown)
-        # ensure notify even if not in list for shutdown safety
         if [ "$has_notify" -ne 1 ]; then
           if [ "$DRY_RUN" = "1" ]; then
             warn "[dry-run] 关机前通知: $title"
@@ -822,6 +857,39 @@ execute_actions() {
         ;;
     esac
   done
+}
+
+do_stop_address() {
+  local cmd="${ADDRESS_STOP_CMD:-/root/address/app/ops/stop.sh}"
+  if [ "$DRY_RUN" = "1" ]; then
+    warn "[dry-run] 将停止 address: $cmd"
+    log "dry-run stop_address: $cmd"
+    return 0
+  fi
+  if [ ! -x "$cmd" ] && [ ! -f "$cmd" ]; then
+    err "address 停止脚本不存在: $cmd"
+    log "stop_address missing: $cmd"
+    return 1
+  fi
+  info "停止 address: $cmd"
+  log "stop_address: $cmd"
+  bash "$cmd"
+}
+
+# 把 actions 列表显示成中文
+actions_label() {
+  local acts="$1" out="通知" a
+  IFS=',' read -ra _al <<<"$acts"
+  for a in "${_al[@]}"; do
+    a=$(echo "$a" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    case "$a" in
+      notify) ;;
+      stop_address|stop-address) out="${out}+停address" ;;
+      shutdown) out="${out}+关机" ;;
+      run:*) out="${out}+${a}" ;;
+    esac
+  done
+  echo "$out"
 }
 
 # ── rules engine ───────────────────────────────────────────────────
@@ -858,6 +926,55 @@ check_rules() {
 }
 
 # ── install / systemd ──────────────────────────────────────────────
+vtm_download_urls() {
+  local url="$1"
+  case "$url" in
+    https://raw.githubusercontent.com/*|https://github.com/*)
+      echo "https://gh-proxy.com/$url"
+      echo "https://ghproxy.net/$url"
+      echo "https://ghfast.top/$url"
+      echo "$url"
+      ;;
+    *)
+      echo "$url"
+      ;;
+  esac
+}
+
+vtm_validate_script_file() {
+  local file="$1"
+  [ -s "$file" ] || { err "校验失败：文件为空"; return 1; }
+  head -1 "$file" 2>/dev/null | grep -q '^#!/bin/bash' || {
+    err "校验失败：不是 bash 脚本"
+    return 1
+  }
+  grep -q 'VTM_NAME="vps-traffic-monitor"' "$file" 2>/dev/null || {
+    err "校验失败：未找到 vps-traffic-monitor 标识"
+    return 1
+  }
+  return 0
+}
+
+vtm_download_script_to() {
+  local target="$1"
+  local url real_url
+  url="${VTM_REPO_RAW}"
+  while IFS= read -r real_url; do
+    [ -z "$real_url" ] && continue
+    info "尝试下载: $real_url"
+    if curl -fsSL --connect-timeout 15 --max-time 120 -o "$target" "$real_url" \
+      && vtm_validate_script_file "$target"; then
+      return 0
+    fi
+    if command -v wget >/dev/null 2>&1 && wget -qO "$target" "$real_url" \
+      && vtm_validate_script_file "$target"; then
+      return 0
+    fi
+    rm -f "$target" 2>/dev/null || true
+  done < <(vtm_download_urls "$url")
+  return 1
+}
+
 install_local() {
   ensure_dirs
   local src
@@ -872,7 +989,7 @@ install_local() {
     ok "使用已有脚本: $VTM_SCRIPT_PATH"
   else
     info "从远程下载脚本..."
-    if ! curl -fsSL --connect-timeout 15 --max-time 120 "$VTM_REPO_RAW" -o "$VTM_SCRIPT_PATH"; then
+    if ! vtm_download_script_to "$VTM_SCRIPT_PATH"; then
       err "下载失败: $VTM_REPO_RAW （也可先把脚本 scp 到本机再 --install）"
       return 1
     fi
@@ -887,6 +1004,42 @@ install_local() {
   echo "  配置: $VTM_CONFIG"
   echo "  状态: $VTM_STATE"
   [ -L "$VTM_BIN_LINK" ] && echo "  命令: vtm"
+}
+
+# Download latest script from GitHub (main), keep config/state.
+update_script() {
+  ensure_dirs
+  local tmp bak new_ver
+  tmp=$(mktemp)
+  info "更新地址: $VTM_REPO_RAW"
+  if ! vtm_download_script_to "$tmp"; then
+    err "更新下载失败"
+    rm -f "$tmp"
+    return 1
+  fi
+  new_ver=$(grep -E '^sh_v=' "$tmp" | head -1 | cut -d= -f2 | tr -d '"')
+  bak="${VTM_SCRIPT_PATH}.bak.$(date +%Y%m%d%H%M%S)"
+  if [ -f "$VTM_SCRIPT_PATH" ]; then
+    cp -f "$VTM_SCRIPT_PATH" "$bak"
+    info "已备份: $bak"
+  fi
+  mv -f "$tmp" "$VTM_SCRIPT_PATH"
+  chmod +x "$VTM_SCRIPT_PATH"
+  if is_root; then
+    ln -sfn "$VTM_SCRIPT_PATH" "$VTM_BIN_LINK" 2>/dev/null || true
+  fi
+  ok "脚本已更新 → v${new_ver:-?}  ($VTM_SCRIPT_PATH)"
+  log "script updated to v${new_ver:-?} from $VTM_REPO_RAW"
+
+  # If current process is the installed script, re-exec new version into menu
+  local self
+  self=$(resolve_self_source)
+  if [ -n "$self" ] && [ "$(readlink -f "$self" 2>/dev/null || echo "$self")" = "$(readlink -f "$VTM_SCRIPT_PATH" 2>/dev/null || echo "$VTM_SCRIPT_PATH")" ]; then
+    info "正在用新版本重新启动菜单..."
+    exec bash "$VTM_SCRIPT_PATH" --menu
+  fi
+  info "下次运行将使用新版本。也可执行: bash $VTM_SCRIPT_PATH"
+  return 0
 }
 
 install_timer() {
@@ -964,58 +1117,44 @@ show_dashboard() {
     pct=$(pct_of "${BILL_USED:-0}" "$qbytes")
   fi
 
-  local tg_s mail_s cmd_s sd_s mon_s timer_s
+  local tg_s mail_s timer_s
   if [ "$TG_ENABLED" = "1" ] && [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
-    tg_s="已配置 chat=$(mask_secret "$TG_CHAT_ID")"
+    tg_s="已开启"
   else
     tg_s="未配置"
   fi
   if [ "$MAIL_ENABLED" = "1" ] && [ -n "$MAIL_HOST" ] && [ -n "$MAIL_TO" ]; then
-    mail_s="已配置 ${MAIL_TO}"
+    mail_s="已开启"
   else
     mail_s="未配置"
   fi
-  if [ "${#CMD_MAP[@]}" -gt 0 ]; then
-    cmd_s="已配置 ${#CMD_MAP[@]} 个: $(echo "${!CMD_MAP[@]}" | tr ' ' ',')"
-  else
-    cmd_s="未配置"
-  fi
-  if [ "$SHUTDOWN_ENABLED" = "1" ]; then
-    sd_s="启用 delay=${SHUTDOWN_DELAY}s"
-  else
-    sd_s="未启用"
-  fi
-  mon_s="规则 ${#RULE_LINES[@]} 条 | dry_run=${DRY_RUN}"
   timer_s=$(timer_status_line)
 
   clear 2>/dev/null || true
-  echo -e "${gl_kjlan}VPS Traffic Monitor${gl_bai}  v${sh_v}"
-  echo -e "实例: ${gl_lv}${INSTANCE_NAME}${gl_bai}  主机: $(hostname 2>/dev/null)  网卡: ${IFACE_NOW:-?}"
+  echo -e "${gl_kjlan}VPS 流量监控${gl_bai}  v${sh_v}"
+  echo -e "主机: $(hostname 2>/dev/null)  网卡: ${IFACE_NOW:-?}  周期: ${CYCLE_ID:-?} (每月${RESET_DAY}日重置)"
   echo "------------------------"
-  echo -e "${gl_kjlan}【流量状态】${gl_bai}"
-  echo "  计量: $(metric_label "$METRIC") | 周期: ${CYCLE_ID:-?} | 重置日: ${RESET_DAY} | TZ: ${TIMEZONE}"
-  echo "  上行: $(bytes_to_human "${TX_USED:-0}") | 下行: $(bytes_to_human "${RX_USED:-0}") | 合计: $(bytes_to_human "${SUM_USED:-0}")"
-  echo "  计费用量: $(bytes_to_human "${BILL_USED:-0}") / ${qh} (${pct}%)"
+  echo -e "${gl_kjlan}【本月流量】${gl_bai}"
+  echo "  上行: $(bytes_to_human "${TX_USED:-0}")"
+  echo "  下行: $(bytes_to_human "${RX_USED:-0}")"
+  echo "  合计: $(bytes_to_human "${SUM_USED:-0}")"
+  [ -n "$QUOTA" ] && echo "  配额参考: ${qh} (默认计量 ${pct}%)"
   if [ "$DRY_RUN" = "1" ]; then
-    echo -e "  ${gl_huang}当前为 DRY-RUN 模式（不执行真实动作）${gl_bai}"
+    echo -e "  ${gl_huang}模拟模式 dry-run：触发时不真正停服/关机${gl_bai}"
   fi
   echo "------------------------"
-  echo -e "${gl_kjlan}【已配置服务】${gl_bai}"
-  echo -e "  $( [ ${#RULE_LINES[@]} -gt 0 ] && service_mark 1 || service_mark 0 ) 流量监控     ${mon_s}"
-  echo -e "  $( [ "$tg_s" != "未配置" ] && service_mark 1 || service_mark 0 ) Telegram     ${tg_s}"
-  echo -e "  $( [ "$mail_s" != "未配置" ] && service_mark 1 || service_mark 0 ) 邮件通知     ${mail_s}"
-  echo -e "  $( [ "$cmd_s" != "未配置" ] && service_mark 1 || service_mark 0 ) 自定义命令   ${cmd_s}"
-  echo -e "  $( [ "$SHUTDOWN_ENABLED" = "1" ] && service_mark 1 || service_mark 0 ) 关机动作     ${sd_s}"
-  echo -e "  $( [ "$timer_s" = "已安装" ] && service_mark 1 || service_mark 0 ) 定时任务     ${timer_s} (每 ${CHECK_INTERVAL_MIN} 分钟)"
+  echo -e "${gl_kjlan}【通知】${gl_bai} Telegram:${tg_s}  邮件:${mail_s}"
+  echo -e "${gl_kjlan}【定时检查】${gl_bai} ${timer_s} (每 ${CHECK_INTERVAL_MIN} 分钟)"
+  echo -e "${gl_kjlan}【终止动作】${gl_bai} 停address / 关机（规则里可选，通知始终发送）"
   echo "------------------------"
   echo -e "${gl_kjlan}【规则】${gl_bai}"
   if [ "${#RULE_LINES[@]}" -eq 0 ]; then
-    echo -e "  ${gl_hui}(无规则，请到 [4] 添加)${gl_bai}"
+    echo -e "  ${gl_hui}(还没有规则，选 [3] 添加)${gl_bai}"
   else
-    local line name th m acts flag used thb
+    local line name th m acts flag used thb i=1
     for line in "${RULE_LINES[@]}"; do
       IFS='|' read -r name th m acts <<<"$line"
-      m=${m:-$METRIC}
+      m=${m:-up}
       used=$(compute_metric_value "$m" "${RX_USED:-0}" "${TX_USED:-0}")
       thb=$(parse_size "$th")
       if is_fired "$name"; then
@@ -1023,26 +1162,128 @@ show_dashboard() {
       elif [ "$(awk -v u="$used" -v t="$thb" 'BEGIN{print (u+0>=t+0)?1:0}')" -eq 1 ]; then
         flag="${gl_hong}[应触发]${gl_bai}"
       else
-        flag="${gl_hui}[待触发]${gl_bai}"
+        flag="${gl_hui}[监控中]${gl_bai}"
       fi
-      echo -e "  · ${th} $(metric_label "$m") → ${acts}  ${flag}"
+      echo -e "  ${i}. ${name}  $(metric_label "$m") ≥ ${th}  → $(actions_label "$acts")  已用$(bytes_to_human "$used")  ${flag}"
+      i=$((i + 1))
     done
   fi
   echo "------------------------"
-  echo -e "${gl_lv}1.${gl_bai} 刷新总览"
-  echo -e "${gl_lv}2.${gl_bai} 立即检查流量 / 执行规则"
-  echo -e "${gl_lv}3.${gl_bai} 通知设置 (Telegram / 邮件)"
-  echo -e "${gl_lv}4.${gl_bai} 规则管理"
-  echo -e "${gl_lv}5.${gl_bai} 命令与动作"
-  echo -e "${gl_lv}6.${gl_bai} 实例与计费设置"
-  echo -e "${gl_lv}7.${gl_bai} 测试通知"
-  echo -e "${gl_lv}8.${gl_bai} 安装 / 卸载定时任务"
-  echo -e "${gl_lv}9.${gl_bai} 高级 (dry-run / 重置周期 / 安装脚本)"
+  echo -e "${gl_lv}1.${gl_bai} 刷新"
+  echo -e "${gl_lv}2.${gl_bai} 立即检查一次"
+  echo -e "${gl_lv}3.${gl_bai} 添加规则"
+  echo -e "${gl_lv}4.${gl_bai} 删除规则"
+  echo -e "${gl_lv}5.${gl_bai} 通知设置 / 测试"
+  echo -e "${gl_lv}6.${gl_bai} 开启或关闭定时检查"
+  echo -e "${gl_lv}7.${gl_bai} 简单设置（配额/重置日/模拟模式等）"
+  echo -e "${gl_lv}8.${gl_bai} 更新脚本"
   echo -e "${gl_lv}0.${gl_bai} 退出"
   echo "------------------------"
 }
 
 # ── menus ──────────────────────────────────────────────────────────
+
+# 向导：名称 → 方向 → 阈值 → 可选终止动作（通知固定）
+wizard_add_rule() {
+  load_config
+  clear 2>/dev/null || true
+  echo -e "${gl_kjlan}添加规则${gl_bai}"
+  echo "------------------------"
+  echo "流程: 名称 → 流量方向 → 阈值 → 是否停 address / 关机"
+  echo -e "${gl_hui}触发时一定发通知；停 address、关机可都不选、选一个或两个都选${gl_bai}"
+  echo "------------------------"
+
+  local name dir m th act_stop act_off acts
+  read -r -p "1) 规则名称 (如 stop-at-6.5t): " name
+  if [ -z "$name" ]; then err "名称不能为空"; press_any; return 1; fi
+  name=$(echo "$name" | tr -d '[:space:]')
+
+  echo ""
+  echo "2) 统计哪边的流量?"
+  echo "   1. 上行 (出站，Oracle 常用)"
+  echo "   2. 下行 (入站)"
+  echo "   3. 双向合计"
+  read -r -p "请选择 [1]: " dir
+  dir=${dir:-1}
+  case "$dir" in
+    1) m=up ;;
+    2) m=down ;;
+    3) m=sum ;;
+    *) err "无效选择"; press_any; return 1 ;;
+  esac
+
+  echo ""
+  read -r -p "3) 达到多少流量触发? (如 6.5T / 800G / 100M): " th
+  if [ -z "$th" ]; then err "阈值不能为空"; press_any; return 1; fi
+  if [ "$(parse_size "$th")" = "0" ]; then err "阈值格式无效"; press_any; return 1; fi
+
+  echo ""
+  echo "4) 额外动作（通知一定会发）"
+  read -r -p "   达到后停止 address 服务? [y/N]: " act_stop
+  read -r -p "   达到后关机? [y/N]: " act_off
+
+  acts="notify"
+  if [[ "$act_stop" =~ ^[Yy]$ ]]; then
+    acts="${acts},stop_address"
+  fi
+  if [[ "$act_off" =~ ^[Yy]$ ]]; then
+    acts="${acts},shutdown"
+  fi
+
+  echo ""
+  echo "预览:"
+  echo "  名称: $name"
+  echo "  方向: $(metric_label "$m")"
+  echo "  阈值: $th"
+  echo "  动作: $(actions_label "$acts")"
+  if ! confirm_yes "确认添加?"; then
+    warn "已取消"
+    press_any
+    return 1
+  fi
+
+  RULE_LINES+=("${name}|${th}|${m}|${acts}")
+  save_rules
+  ok "已添加规则: $name"
+  press_any
+}
+
+wizard_delete_rule() {
+  load_config
+  clear 2>/dev/null || true
+  echo -e "${gl_kjlan}删除规则${gl_bai}"
+  echo "------------------------"
+  if [ "${#RULE_LINES[@]}" -eq 0 ]; then
+    warn "当前没有规则"
+    press_any
+    return
+  fi
+  local i=1 line name th m acts
+  for line in "${RULE_LINES[@]}"; do
+    IFS='|' read -r name th m acts <<<"$line"
+    echo "  $i) $name  $(metric_label "$m") ≥ $th  → $(actions_label "$acts")"
+    i=$((i + 1))
+  done
+  echo "  0) 取消"
+  echo "------------------------"
+  local idx
+  read -r -p "输入要删除的序号: " idx
+  if [ "$idx" = "0" ] || [ -z "$idx" ]; then return; fi
+  if [[ "$idx" =~ ^[0-9]+$ ]] && [ "$idx" -ge 1 ] && [ "$idx" -le "${#RULE_LINES[@]}" ]; then
+    local new=() j=1
+    for line in "${RULE_LINES[@]}"; do
+      [ "$j" -ne "$idx" ] && new+=("$line")
+      j=$((j + 1))
+    done
+    RULE_LINES=("${new[@]}")
+    save_rules
+    ok "已删除"
+  else
+    err "无效序号"
+  fi
+  press_any
+}
+
 menu_notify() {
   while true; do
     load_config
@@ -1050,342 +1291,175 @@ menu_notify() {
     echo -e "${gl_kjlan}通知设置${gl_bai}"
     echo "------------------------"
     echo "Telegram: enabled=${TG_ENABLED} token=$( [ -n "$TG_BOT_TOKEN" ] && mask_secret "$TG_BOT_TOKEN" || echo 空 ) chat=$( [ -n "$TG_CHAT_ID" ] && mask_secret "$TG_CHAT_ID" || echo 空 )"
-    echo "Email: enabled=${MAIL_ENABLED} host=${MAIL_HOST:-空} to=${MAIL_TO:-空} port=${MAIL_PORT}"
+    echo "邮件:     enabled=${MAIL_ENABLED} host=${MAIL_HOST:-空} to=${MAIL_TO:-空}"
+    echo -e "${gl_hui}配置时会先发测试，成功才保存${gl_bai}"
     echo "------------------------"
     echo "1. 配置 Telegram"
-    echo "2. 开关 Telegram"
-    echo "3. 配置邮件"
-    echo "4. 开关邮件"
+    echo "2. 配置邮件"
+    echo "3. 测试 Telegram"
+    echo "4. 测试邮件"
+    echo "5. 测试已开启的通知"
+    echo "6. 关闭 Telegram"
+    echo "7. 关闭邮件"
     echo "0. 返回"
     echo "------------------------"
     local c
     read -r -p "请输入数字: " c
     case "$c" in
       1)
+        load_config
         local t id ep
+        local old_token="$TG_BOT_TOKEN" old_chat="$TG_CHAT_ID" old_ep="$TG_ENDPOINT"
         read -r -p "Bot Token (回车保留): " t
         read -r -p "Chat ID (回车保留): " id
-        read -r -p "API Endpoint (回车保留默认): " ep
-        [ -n "$t" ] && set_config_kv TG_BOT_TOKEN "$t"
-        [ -n "$id" ] && set_config_kv TG_CHAT_ID "$id"
-        [ -n "$ep" ] && set_config_kv TG_ENDPOINT "$ep"
-        set_config_kv TG_ENABLED 1
-        ok "已保存 Telegram"
+        read -r -p "API Endpoint (回车保留): " ep
+        [ -n "$t" ] && TG_BOT_TOKEN="$t"
+        [ -n "$id" ] && TG_CHAT_ID="$id"
+        [ -n "$ep" ] && TG_ENDPOINT="$ep"
+        TG_ENDPOINT=${TG_ENDPOINT:-https://api.telegram.org/bot}
+        if [ -z "$TG_BOT_TOKEN" ] || [ -z "$TG_CHAT_ID" ]; then
+          err "Token 与 Chat ID 不能为空"
+          TG_BOT_TOKEN="$old_token"; TG_CHAT_ID="$old_chat"; TG_ENDPOINT="$old_ep"
+          press_any; continue
+        fi
+        if test_telegram "VPS 流量监控 · Telegram 测试" "$(build_status_text)"; then
+          set_config_kv TG_BOT_TOKEN "$TG_BOT_TOKEN"
+          set_config_kv TG_CHAT_ID "$TG_CHAT_ID"
+          set_config_kv TG_ENDPOINT "$TG_ENDPOINT"
+          set_config_kv TG_ENABLED 1
+          ok "Telegram 已保存并开启"
+        else
+          TG_BOT_TOKEN="$old_token"; TG_CHAT_ID="$old_chat"; TG_ENDPOINT="$old_ep"
+          warn "测试失败，未保存"
+        fi
         press_any
         ;;
       2)
         load_config
-        if [ "$TG_ENABLED" = "1" ]; then set_config_kv TG_ENABLED 0; ok "已关闭 Telegram"
-        else set_config_kv TG_ENABLED 1; ok "已开启 Telegram"; fi
-        press_any
-        ;;
-      3)
         local h p u pw fr to ssl
-        read -r -p "SMTP Host: " h
-        read -r -p "SMTP Port [465]: " p
-        p=${p:-465}
-        read -r -p "Username: " u
-        read -r -p "Password: " pw
-        read -r -p "From: " fr
-        read -r -p "To (逗号分隔多个): " to
-        read -r -p "Use SSL 1/0 [1]: " ssl
-        ssl=${ssl:-1}
-        [ -n "$h" ] && set_config_kv MAIL_HOST "$h"
-        set_config_kv MAIL_PORT "$p"
-        [ -n "$u" ] && set_config_kv MAIL_USER "$u"
-        [ -n "$pw" ] && set_config_kv MAIL_PASS "$pw"
-        [ -n "$fr" ] && set_config_kv MAIL_FROM "$fr"
-        [ -n "$to" ] && set_config_kv MAIL_TO "$to"
-        set_config_kv MAIL_USE_SSL "$ssl"
-        set_config_kv MAIL_ENABLED 1
-        ok "已保存邮件"
-        press_any
-        ;;
-      4)
-        load_config
-        if [ "$MAIL_ENABLED" = "1" ]; then set_config_kv MAIL_ENABLED 0; ok "已关闭邮件"
-        else set_config_kv MAIL_ENABLED 1; ok "已开启邮件"; fi
-        press_any
-        ;;
-      0) return ;;
-      *) warn "无效选项"; sleep 1 ;;
-    esac
-  done
-}
-
-menu_rules() {
-  while true; do
-    load_config
-    clear 2>/dev/null || true
-    echo -e "${gl_kjlan}规则管理${gl_bai}"
-    echo "------------------------"
-    local i=1 line
-    if [ "${#RULE_LINES[@]}" -eq 0 ]; then
-      echo "(无规则)"
-    else
-      for line in "${RULE_LINES[@]}"; do
-        echo "  $i) $line"
-        i=$((i + 1))
-      done
-    fi
-    echo "------------------------"
-    echo "1. 添加规则"
-    echo "2. 删除规则"
-    echo "3. 清空全部规则"
-    echo "0. 返回"
-    echo "------------------------"
-    local c
-    read -r -p "请输入数字: " c
-    case "$c" in
-      1)
-        local n th m ac
-        echo "格式示例: name=stop-app threshold=6.5T metric=up actions=notify,run:stop_heavy_app"
-        read -r -p "规则名: " n
-        read -r -p "阈值 (如 6.5T): " th
-        read -r -p "计量 up/down/sum [up]: " m
-        m=${m:-up}
-        read -r -p "动作 (notify,run:xxx,shutdown): " ac
-        ac=${ac:-notify}
-        if [ -z "$n" ] || [ -z "$th" ]; then
-          err "名称和阈值必填"
+        local old_h="$MAIL_HOST" old_p="$MAIL_PORT" old_u="$MAIL_USER" old_pw="$MAIL_PASS"
+        local old_fr="$MAIL_FROM" old_to="$MAIL_TO" old_ssl="$MAIL_USE_SSL"
+        read -r -p "SMTP Host (回车保留): " h
+        read -r -p "SMTP Port [${MAIL_PORT:-465}]: " p
+        read -r -p "Username (回车保留): " u
+        read -r -p "Password (回车保留): " pw
+        read -r -p "From (回车保留): " fr
+        read -r -p "To (回车保留): " to
+        read -r -p "Use SSL 1/0 [${MAIL_USE_SSL:-1}]: " ssl
+        [ -n "$h" ] && MAIL_HOST="$h"
+        [ -n "$p" ] && MAIL_PORT="$p" || MAIL_PORT=${MAIL_PORT:-465}
+        [ -n "$u" ] && MAIL_USER="$u"
+        [ -n "$pw" ] && MAIL_PASS="$pw"
+        [ -n "$fr" ] && MAIL_FROM="$fr"
+        [ -n "$to" ] && MAIL_TO="$to"
+        [ -n "$ssl" ] && MAIL_USE_SSL="$ssl" || MAIL_USE_SSL=${MAIL_USE_SSL:-1}
+        if [ -z "$MAIL_HOST" ] || [ -z "$MAIL_FROM" ] || [ -z "$MAIL_TO" ]; then
+          err "Host / From / To 不能为空"
+          MAIL_HOST="$old_h"; MAIL_PORT="$old_p"; MAIL_USER="$old_u"; MAIL_PASS="$old_pw"
+          MAIL_FROM="$old_fr"; MAIL_TO="$old_to"; MAIL_USE_SSL="$old_ssl"
+          press_any; continue
+        fi
+        if test_email "VPS 流量监控 · 邮件测试" "$(build_status_text)"; then
+          set_config_kv MAIL_HOST "$MAIL_HOST"
+          set_config_kv MAIL_PORT "$MAIL_PORT"
+          set_config_kv MAIL_USER "$MAIL_USER"
+          set_config_kv MAIL_PASS "$MAIL_PASS"
+          set_config_kv MAIL_FROM "$MAIL_FROM"
+          set_config_kv MAIL_TO "$MAIL_TO"
+          set_config_kv MAIL_USE_SSL "$MAIL_USE_SSL"
+          set_config_kv MAIL_ENABLED 1
+          ok "邮件已保存并开启"
         else
-          RULE_LINES+=("${n}|${th}|${m}|${ac}")
-          save_rules
-          ok "已添加"
+          MAIL_HOST="$old_h"; MAIL_PORT="$old_p"; MAIL_USER="$old_u"; MAIL_PASS="$old_pw"
+          MAIL_FROM="$old_fr"; MAIL_TO="$old_to"; MAIL_USE_SSL="$old_ssl"
+          warn "测试失败，未保存"
         fi
         press_any
         ;;
-      2)
-        local idx
-        read -r -p "删除序号: " idx
-        if [[ "$idx" =~ ^[0-9]+$ ]] && [ "$idx" -ge 1 ] && [ "$idx" -le "${#RULE_LINES[@]}" ]; then
-          local new=()
-          local j=1
-          for line in "${RULE_LINES[@]}"; do
-            [ "$j" -ne "$idx" ] && new+=("$line")
-            j=$((j + 1))
-          done
-          RULE_LINES=("${new[@]}")
-          save_rules
-          ok "已删除"
-        else
-          err "无效序号"
-        fi
-        press_any
-        ;;
-      3)
-        if confirm_YES "输入 YES 清空全部规则"; then
-          RULE_LINES=()
-          save_rules
-          ok "已清空"
-        fi
-        press_any
-        ;;
-      0) return ;;
-      *) warn "无效选项"; sleep 1 ;;
-    esac
-  done
-}
-
-menu_commands() {
-  while true; do
-    load_config
-    clear 2>/dev/null || true
-    echo -e "${gl_kjlan}命令与动作${gl_bai}"
-    echo "------------------------"
-    echo "命名命令 (规则里用 run:名称 调用):"
-    if [ "${#CMD_MAP[@]}" -eq 0 ]; then
-      echo "  (无)"
-    else
-      local n
-      for n in "${!CMD_MAP[@]}"; do
-        echo "  $n = ${CMD_MAP[$n]}"
-      done
-    fi
-    echo "------------------------"
-    echo "关机: enabled=${SHUTDOWN_ENABLED} delay=${SHUTDOWN_DELAY}s"
-    echo "  cmd: ${SHUTDOWN_CMD}"
-    echo "------------------------"
-    echo "1. 添加/修改命名命令"
-    echo "2. 删除命名命令"
-    echo "3. 设置关机参数"
-    echo "4. 开关关机动作"
-    echo "5. 手动执行命名命令"
-    echo "0. 返回"
-    echo "------------------------"
-    local c
-    read -r -p "请输入数字: " c
-    case "$c" in
-      1)
-        local name path
-        read -r -p "命令名 (如 stop_heavy_app): " name
-        read -r -p "执行内容 (shell): " path
-        if [ -n "$name" ] && [ -n "$path" ]; then
-          save_cmd "$name" "$path"
-          ok "已保存 CMD_${name}"
-        else
-          err "不能为空"
-        fi
-        press_any
-        ;;
-      2)
-        local name
-        read -r -p "要删除的命令名: " name
-        delete_cmd "$name"
-        ok "已删除"
-        press_any
-        ;;
-      3)
-        local d cmd
-        read -r -p "关机延迟秒数 [${SHUTDOWN_DELAY}]: " d
-        read -r -p "关机命令 [${SHUTDOWN_CMD}]: " cmd
-        [ -n "$d" ] && set_config_kv SHUTDOWN_DELAY "$d"
-        [ -n "$cmd" ] && set_config_kv SHUTDOWN_CMD "$cmd"
-        ok "已保存"
-        press_any
-        ;;
-      4)
-        load_config
-        if [ "$SHUTDOWN_ENABLED" = "1" ]; then set_config_kv SHUTDOWN_ENABLED 0; ok "已禁用关机"
-        else set_config_kv SHUTDOWN_ENABLED 1; ok "已启用关机"; fi
-        press_any
-        ;;
+      3) load_config; test_telegram; press_any ;;
+      4) load_config; test_email; press_any ;;
       5)
-        local name
-        read -r -p "命令名: " name
         load_config
-        run_named_cmd "$name"
+        local any=0
+        if [ "$TG_ENABLED" = "1" ]; then test_telegram && any=1; else warn "Telegram 未开启"; fi
+        if [ "$MAIL_ENABLED" = "1" ]; then test_email && any=1; else warn "邮件未开启"; fi
+        [ "$any" -eq 1 ] && ok "测试结束" || err "没有可用通道"
         press_any
         ;;
+      6) set_config_kv TG_ENABLED 0; ok "已关闭 Telegram"; press_any ;;
+      7) set_config_kv MAIL_ENABLED 0; ok "已关闭邮件"; press_any ;;
       0) return ;;
       *) warn "无效选项"; sleep 1 ;;
     esac
   done
 }
 
-menu_billing() {
+menu_timer_simple() {
+  clear 2>/dev/null || true
+  echo -e "${gl_kjlan}定时检查${gl_bai}"
+  echo "------------------------"
+  echo "状态: $(timer_status_line)"
+  echo "间隔: ${CHECK_INTERVAL_MIN:-5} 分钟（在「简单设置」可改）"
+  echo "------------------------"
+  echo "1. 开启定时检查（systemd）"
+  echo "2. 关闭定时检查"
+  echo "0. 返回"
+  echo "------------------------"
+  local c
+  read -r -p "请输入数字: " c
+  case "$c" in
+    1) install_timer; press_any ;;
+    2) uninstall_timer; press_any ;;
+    0) return ;;
+    *) warn "无效选项"; press_any ;;
+  esac
+}
+
+menu_simple_settings() {
   load_config
   clear 2>/dev/null || true
-  echo -e "${gl_kjlan}实例与计费设置${gl_bai}"
+  echo -e "${gl_kjlan}简单设置${gl_bai}"
   echo "------------------------"
   echo "当前:"
-  echo "  INSTANCE_NAME=$INSTANCE_NAME"
-  echo "  INTERFACE=${INTERFACE:-自动}"
-  echo "  METRIC=$METRIC"
-  echo "  RESET_DAY=$RESET_DAY"
-  echo "  TIMEZONE=$TIMEZONE"
-  echo "  QUOTA=$QUOTA"
-  echo "  CHECK_INTERVAL_MIN=$CHECK_INTERVAL_MIN"
+  echo "  实例名: $INSTANCE_NAME"
+  echo "  网卡: ${INTERFACE:-自动}"
+  echo "  月重置日: $RESET_DAY"
+  echo "  时区: $TIMEZONE"
+  echo "  配额展示: ${QUOTA:-未设}"
+  echo "  检查间隔: ${CHECK_INTERVAL_MIN} 分钟"
+  echo "  模拟模式 dry-run: $DRY_RUN  (1=只演练不真正停服/关机)"
+  echo "  address 停止脚本: $ADDRESS_STOP_CMD"
+  echo "  关机延迟秒: $SHUTDOWN_DELAY"
   echo "------------------------"
   local v
-  read -r -p "实例名 (回车保留): " v; [ -n "$v" ] && set_config_kv INSTANCE_NAME "$v"
-  read -r -p "网卡 (空=自动, 输入 auto 清空手动): " v
+  read -r -p "实例名 (回车跳过): " v; [ -n "$v" ] && set_config_kv INSTANCE_NAME "$v"
+  read -r -p "网卡 (空=自动, 输入 auto 恢复自动): " v
   if [ "$v" = "auto" ]; then set_config_kv INTERFACE ""
   elif [ -n "$v" ]; then set_config_kv INTERFACE "$v"; fi
-  read -r -p "计量 up/down/sum/max/min (回车保留): " v; [ -n "$v" ] && set_config_kv METRIC "$v"
-  read -r -p "月重置日 1-28 (回车保留): " v; [ -n "$v" ] && set_config_kv RESET_DAY "$v"
-  read -r -p "时区 (回车保留): " v; [ -n "$v" ] && set_config_kv TIMEZONE "$v"
-  read -r -p "配额 如 10T (回车保留): " v; [ -n "$v" ] && set_config_kv QUOTA "$v"
-  read -r -p "检查间隔分钟 (回车保留): " v; [ -n "$v" ] && set_config_kv CHECK_INTERVAL_MIN "$v"
-  ok "已保存（若改了检查间隔，请到菜单 8 重装 timer）"
-  press_any
-}
-
-menu_timer() {
-  while true; do
-    clear 2>/dev/null || true
-    echo -e "${gl_kjlan}定时任务${gl_bai}"
-    echo "------------------------"
-    echo "状态: $(timer_status_line)"
-    if systemctl list-timers "$VTM_TIMER" --no-pager 2>/dev/null | head -5; then
-      :
+  read -r -p "月重置日 1-28 (回车跳过): " v; [ -n "$v" ] && set_config_kv RESET_DAY "$v"
+  read -r -p "时区 (回车跳过): " v; [ -n "$v" ] && set_config_kv TIMEZONE "$v"
+  read -r -p "配额展示 如 10T (回车跳过): " v; [ -n "$v" ] && set_config_kv QUOTA "$v"
+  read -r -p "检查间隔分钟 (回车跳过): " v; [ -n "$v" ] && set_config_kv CHECK_INTERVAL_MIN "$v"
+  read -r -p "模拟模式 1开0关 (回车跳过): " v; [ -n "$v" ] && set_config_kv DRY_RUN "$v"
+  read -r -p "address 停止脚本路径 (回车跳过): " v; [ -n "$v" ] && set_config_kv ADDRESS_STOP_CMD "$v"
+  read -r -p "关机延迟秒 (回车跳过): " v; [ -n "$v" ] && set_config_kv SHUTDOWN_DELAY "$v"
+  if confirm_yes "重置本月流量统计基准? (一般不用)"; then
+    if confirm_YES "输入 YES 确认重置"; then
+      local iface rx tx
+      iface=$(get_iface)
+      read -r rx tx <<<"$(read_counters "$iface")"
+      CYCLE_ID=$(current_cycle_id)
+      BASE_RX=$rx; BASE_TX=$tx; LAST_RX=$rx; LAST_TX=$tx; ACC_RX=0; ACC_TX=0
+      save_state
+      clear_fired
+      CYCLE_ID=$(current_cycle_id)
+      BASE_RX=$rx; BASE_TX=$tx; LAST_RX=$rx; LAST_TX=$tx; ACC_RX=0; ACC_TX=0
+      save_state
+      ok "已重置周期基准"
     fi
-    echo "------------------------"
-    echo "1. 安装/更新 systemd timer"
-    echo "2. 卸载 timer"
-    echo "3. 查看最近日志"
-    echo "0. 返回"
-    echo "------------------------"
-    local c
-    read -r -p "请输入数字: " c
-    case "$c" in
-      1) install_timer; press_any ;;
-      2) uninstall_timer; press_any ;;
-      3)
-        journalctl -u "$VTM_SERVICE" -n 30 --no-pager 2>/dev/null || tail -n 30 "$VTM_LOG" 2>/dev/null || echo "无日志"
-        press_any
-        ;;
-      0) return ;;
-      *) warn "无效选项"; sleep 1 ;;
-    esac
-  done
-}
-
-menu_advanced() {
-  while true; do
-    load_config
-    clear 2>/dev/null || true
-    echo -e "${gl_kjlan}高级${gl_bai}"
-    echo "------------------------"
-    echo "DRY_RUN=${DRY_RUN}"
-    echo "配置: $VTM_CONFIG"
-    echo "状态: $VTM_STATE"
-    echo "日志: $VTM_LOG"
-    echo "------------------------"
-    echo "1. 切换 dry-run"
-    echo "2. 重置当前计费周期 (清零用量基准)"
-    echo "3. 安装脚本到本机 ($VTM_ROOT)"
-    echo "4. 应用 Oracle 出站示例规则 (6.5T停服/8T关机)"
-    echo "5. 查看 state 文件"
-    echo "0. 返回"
-    echo "------------------------"
-    local c
-    read -r -p "请输入数字: " c
-    case "$c" in
-      1)
-        if [ "$DRY_RUN" = "1" ]; then set_config_kv DRY_RUN 0; ok "dry-run 关闭"
-        else set_config_kv DRY_RUN 1; ok "dry-run 开启"; fi
-        press_any
-        ;;
-      2)
-        if confirm_YES "输入 YES 重置周期基准"; then
-          local iface rx tx
-          iface=$(get_iface)
-          read -r rx tx <<<"$(read_counters "$iface")"
-          CYCLE_ID=$(current_cycle_id)
-          BASE_RX=$rx; BASE_TX=$tx; LAST_RX=$rx; LAST_TX=$tx; ACC_RX=0; ACC_TX=0
-          save_state
-          clear_fired
-          CYCLE_ID=$(current_cycle_id)
-          BASE_RX=$rx; BASE_TX=$tx; LAST_RX=$rx; LAST_TX=$tx; ACC_RX=0; ACC_TX=0
-          save_state
-          ok "已重置"
-        fi
-        press_any
-        ;;
-      3) install_local; press_any ;;
-      4)
-        if confirm_yes "写入示例规则与 address 停服命令?"; then
-          set_config_kv METRIC up
-          set_config_kv QUOTA 10T
-          set_config_kv "CMD_stop_heavy_app" "/root/address/app/ops/stop.sh"
-          RULE_LINES=(
-            "stop-app|6.5T|up|notify,run:stop_heavy_app"
-            "poweroff|8T|up|notify,shutdown"
-          )
-          save_rules
-          ok "已写入 Oracle 示例（请再配置通知）"
-        fi
-        press_any
-        ;;
-      5)
-        cat "$VTM_STATE" 2>/dev/null || echo "无 state"
-        press_any
-        ;;
-      0) return ;;
-      *) warn "无效选项"; sleep 1 ;;
-    esac
-  done
+  fi
+  ok "已保存。若改了检查间隔，请到菜单 6 重新开启定时检查"
+  press_any
 }
 
 main_menu() {
@@ -1405,18 +1479,20 @@ main_menu() {
         build_status_text
         press_any
         ;;
-      3) menu_notify ;;
-      4) menu_rules ;;
-      5) menu_commands ;;
-      6) menu_billing ;;
-      7)
+      3) wizard_add_rule ;;
+      4) wizard_delete_rule ;;
+      5) menu_notify ;;
+      6)
         load_config
-        send_notify "VPS Traffic Monitor 测试" "$(build_status_text)" \
-          && ok "测试完成" || err "测试失败（检查通道配置）"
+        menu_timer_simple
+        ;;
+      7) menu_simple_settings ;;
+      8)
+        if confirm_yes "从 GitHub 更新脚本（保留本机配置）?"; then
+          update_script
+        fi
         press_any
         ;;
-      8) menu_timer ;;
-      9) menu_advanced ;;
       0)
         echo "bye"
         exit 0
@@ -1439,9 +1515,12 @@ VPS Traffic Monitor v${sh_v}
   $0 --menu         同上
   $0 --check        静默检查并执行规则 (systemd timer)
   $0 --status       打印流量状态
-  $0 --test-notify  发送测试通知
-  $0 --install      安装脚本到 $VTM_ROOT
-  $0 --install-timer 安装 systemd timer
+  $0 --test-notify        测试全部已启用通知
+  $0 --test-telegram      仅测试 Telegram
+  $0 --test-email         仅测试邮件
+  $0 --install            安装脚本到 $VTM_ROOT
+  $0 --update             从 GitHub 更新脚本
+  $0 --install-timer      安装 systemd timer
   $0 --uninstall-timer
   $0 --help
 
@@ -1466,11 +1545,31 @@ main() {
       ;;
     --test-notify)
       load_config
-      send_notify "VPS Traffic Monitor 测试" "$(build_status_text)"
+      local rc=1
+      [ "$TG_ENABLED" = "1" ] && test_telegram && rc=0
+      [ "$MAIL_ENABLED" = "1" ] && test_email && rc=0
+      if [ "$TG_ENABLED" != "1" ] && [ "$MAIL_ENABLED" != "1" ]; then
+        err "未启用任何通知通道"
+        exit 1
+      fi
+      exit $rc
+      ;;
+    --test-telegram)
+      load_config
+      test_telegram
+      exit $?
+      ;;
+    --test-email)
+      load_config
+      test_email
       exit $?
       ;;
     --install)
       install_local
+      exit $?
+      ;;
+    --update)
+      update_script
       exit $?
       ;;
     --install-timer)
