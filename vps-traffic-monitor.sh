@@ -1,7 +1,7 @@
 #!/bin/bash
 # VPS Traffic Monitor — multi-server bandwidth guard with numeric TUI
 # Usage:
-#   bash <(curl -fsSL https://raw.githubusercontent.com/<owner>/<repo>/master/vps-traffic-monitor.sh)
+#   bash <(curl -fsSL https://raw.githubusercontent.com/<owner>/<repo>/main/vps-traffic-monitor.sh)
 #   ./vps-traffic-monitor.sh
 #   ./vps-traffic-monitor.sh --check
 sh_v="1.0.0"
@@ -25,7 +25,7 @@ VTM_STATE_DIR="${VTM_STATE_DIR:-/var/lib/vps-traffic-monitor}"
 VTM_STATE="$VTM_STATE_DIR/state"
 VTM_LOG="${VTM_LOG:-/var/log/vps-traffic-monitor.log}"
 VTM_SCRIPT_PATH="$VTM_ROOT/vps-traffic-monitor.sh"
-VTM_REPO_RAW="${VTM_REPO_RAW:-https://raw.githubusercontent.com/daimon3332/vps-traffic-montior/master/vps-traffic-monitor.sh}"
+VTM_REPO_RAW="${VTM_REPO_RAW:-https://raw.githubusercontent.com/daimon3332/vps-traffic-montior/main/vps-traffic-monitor.sh}"
 VTM_UNIT_DIR="/etc/systemd/system"
 VTM_SERVICE="vps-traffic-monitor.service"
 VTM_TIMER="vps-traffic-monitor.timer"

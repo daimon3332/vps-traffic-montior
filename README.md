@@ -7,7 +7,7 @@
 ## 一键运行
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/daimon3332/vps-traffic-montior/master/vps-traffic-monitor.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/daimon3332/vps-traffic-montior/main/vps-traffic-monitor.sh)
 ```
 
 > 将 URL 换成你自己的仓库 raw 地址。国内若 GitHub 不稳定，可先下载到本地再 `bash vps-traffic-monitor.sh`。
