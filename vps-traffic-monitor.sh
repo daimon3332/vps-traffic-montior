@@ -4,25 +4,25 @@
 #   bash <(curl -fsSL https://raw.githubusercontent.com/<owner>/<repo>/main/vps-traffic-monitor.sh)
 #   ./vps-traffic-monitor.sh
 #   ./vps-traffic-monitor.sh --check
-sh_v="1.2.2"
+sh_v="1.3.0"
 
 # ── colors (linux-tools-daimon style) ──────────────────────────────
 gl_hui='\e[37m'
 gl_hong='\033[31m'
 gl_lv='\033[32m'
 gl_huang='\033[33m'
-gl_lan='\033[34m'
 gl_bai='\033[0m'
-gl_zi='\033[35m'
 gl_kjlan='\033[96m'
 
 # ── paths ──────────────────────────────────────────────────────────
+# shellcheck disable=SC2034 # Download validation uses this literal as the script marker.
 VTM_NAME="vps-traffic-monitor"
 VTM_ROOT="${VTM_ROOT:-/root/vps-traffic-monitor}"
 VTM_BIN_LINK="/usr/local/bin/vtm"
 VTM_CONFIG="$VTM_ROOT/config.conf"
 VTM_STATE_DIR="${VTM_STATE_DIR:-/var/lib/vps-traffic-monitor}"
 VTM_STATE="$VTM_STATE_DIR/state"
+VTM_LOCK="$VTM_STATE_DIR/lock"
 VTM_LOG="${VTM_LOG:-/var/log/vps-traffic-monitor.log}"
 VTM_SCRIPT_PATH="$VTM_ROOT/vps-traffic-monitor.sh"
 VTM_REPO_RAW="${VTM_REPO_RAW:-https://raw.githubusercontent.com/daimon3332/vps-traffic-montior/main/vps-traffic-monitor.sh}"
@@ -68,7 +68,8 @@ declare -A CMD_MAP=()
 # ═══════════════════════════════════════════════════════════════════
 
 log() {
-  local msg="[$(date '+%F %T')] $*"
+  local msg
+  msg="[$(date '+%F %T')] $*"
   echo "$msg" >>"$VTM_LOG" 2>/dev/null || true
 }
 
@@ -117,10 +118,39 @@ confirm_YES() {
 }
 
 ensure_dirs() {
-  mkdir -p "$VTM_ROOT" "$VTM_STATE_DIR" "$(dirname "$VTM_LOG")" 2>/dev/null || true
+  mkdir -p "$VTM_ROOT" "$VTM_STATE_DIR" "$(dirname "$VTM_LOG")" 2>/dev/null || {
+    err "无法创建运行目录"
+    return 1
+  }
+  chmod 700 "$VTM_ROOT" "$VTM_STATE_DIR" 2>/dev/null || true
 }
 
 is_root() { [ "$(id -u)" -eq 0 ]; }
+
+acquire_lock() {
+  [ "${VTM_LOCK_HELD:-0}" = "1" ] && return 0
+  ensure_dirs || return 1
+  command -v flock >/dev/null 2>&1 || {
+    err "缺少 flock，无法安全更新监控状态"
+    log "state lock unavailable: flock missing"
+    return 1
+  }
+  exec 9>"$VTM_LOCK" || return 1
+  if ! flock -w 30 9; then
+    exec 9>&-
+    err "等待监控状态锁超时"
+    log "state lock timeout"
+    return 1
+  fi
+  VTM_LOCK_HELD=1
+}
+
+release_lock() {
+  [ "${VTM_LOCK_HELD:-0}" = "1" ] || return 0
+  flock -u 9 2>/dev/null || true
+  exec 9>&-
+  VTM_LOCK_HELD=0
+}
 
 resolve_self_source() {
   local src=""
@@ -140,9 +170,9 @@ resolve_self_source() {
 bytes_to_human() {
   awk -v b="$1" 'BEGIN{
     if (b < 0) b = 0
-    u[0]="B"; u[1]="KB"; u[2]="MB"; u[3]="GB"; u[4]="TB"; u[5]="PB"
+    u[0]="B"; u[1]="KiB"; u[2]="MiB"; u[3]="GiB"; u[4]="TiB"; u[5]="PiB"; u[6]="EiB"
     i=0
-    while (b >= 1024 && i < 5) { b/=1024; i++ }
+    while (b >= 1024 && i < 6) { b/=1024; i++ }
     if (i==0) printf "%d %s", b, u[i]
     else printf "%.2f %s", b, u[i]
   }'
@@ -150,23 +180,24 @@ bytes_to_human() {
 
 # parse 6.5T / 10G / 1024M / bare number(bytes) -> bytes (mawk-safe)
 parse_size() {
-  local s="$1"
-  echo "$s" | awk '
-  {
-    s=$0
-    gsub(/ /,"",s)
-    n = s + 0
-    u = s
-    sub(/^[0-9.]+/, "", u)
-    u = tolower(u)
-    m = 1
-    if (u ~ /^k/) m = 1024
-    else if (u ~ /^m/) m = 1024 * 1024
-    else if (u ~ /^g/) m = 1024 * 1024 * 1024
-    else if (u ~ /^t/) m = 1024 * 1024 * 1024 * 1024
-    else if (u ~ /^p/) m = 1024 * 1024 * 1024 * 1024 * 1024
-    printf "%.0f", n * m
-  }'
+  local s="${1//[[:space:]]/}" n u m
+  s=${s^^}
+  if [[ ! "$s" =~ ^([0-9]+([.][0-9]+)?)([KMGTPE]?I?B?)$ ]]; then
+    return 1
+  fi
+  n="${BASH_REMATCH[1]}"
+  u="${BASH_REMATCH[3]}"
+  case "$u" in
+    ""|B) m=1 ;;
+    K|KB|KIB) m=1024 ;;
+    M|MB|MIB) m=$((1024 ** 2)) ;;
+    G|GB|GIB) m=$((1024 ** 3)) ;;
+    T|TB|TIB) m=$((1024 ** 4)) ;;
+    P|PB|PIB) m=$((1024 ** 5)) ;;
+    E|EB|EIB) m=$(awk 'BEGIN{printf "%.0f", 1024^6}') ;;
+    *) return 1 ;;
+  esac
+  awk -v n="$n" -v m="$m" 'BEGIN{printf "%.0f", n*m}'
 }
 
 # percent used/quota
@@ -181,42 +212,39 @@ pct_of() {
 
 # ── interface / counters ───────────────────────────────────────────
 detect_interface() {
-  local iface
+  local iface net_root="${VTM_SYS_CLASS_NET:-/sys/class/net}"
   iface=$(ip -o route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
-  if [ -z "$iface" ]; then
-    iface=$(awk -F: 'NR>2 {
-      gsub(/ /,"",$1)
-      if ($1!="lo" && $1 !~ /^docker/ && $1 !~ /^br-/ && $1 !~ /^veth/ && $1 !~ /^virbr/) {
-        print $1; exit
-      }
-    }' /proc/net/dev 2>/dev/null)
+  if [ -n "$iface" ] && [ -d "$net_root/$iface" ]; then
+    printf '%s\n' "$iface"
+    return 0
   fi
-  echo "${iface:-enp0s6}"
+  for iface in "$net_root"/*; do
+    [ -d "$iface" ] || continue
+    iface=${iface##*/}
+    case "$iface" in
+      lo|docker*|br-*|veth*|virbr*) continue ;;
+    esac
+    printf '%s\n' "$iface"
+    return 0
+  done
+  return 1
 }
 
 # print: rx_bytes tx_bytes
 read_counters() {
-  local iface="$1"
-  awk -v iface="$iface" -F: '
-    NR > 2 {
-      name = $1
-      gsub(/^[ \t]+|[ \t]+$/, "", name)
-      if (name == iface) {
-        n = split($2, f, /[ \t]+/)
-        idx = 1
-        if (f[1] == "") idx = 2
-        rx = f[idx] + 0
-        tx = f[idx + 8] + 0
-        print rx, tx
-        exit
-      }
-    }
-  ' /proc/net/dev
+  local iface="$1" net_root="${VTM_SYS_CLASS_NET:-/sys/class/net}" rx tx
+  [[ "$iface" =~ ^[A-Za-z0-9_.:-]+$ ]] || return 1
+  [ -r "$net_root/$iface/statistics/rx_bytes" ] || return 1
+  [ -r "$net_root/$iface/statistics/tx_bytes" ] || return 1
+  read -r rx <"$net_root/$iface/statistics/rx_bytes" || return 1
+  read -r tx <"$net_root/$iface/statistics/tx_bytes" || return 1
+  [[ "$rx" =~ ^[0-9]+$ && "$tx" =~ ^[0-9]+$ ]] || return 1
+  printf '%s %s\n' "$rx" "$tx"
 }
 
 get_iface() {
-  if [ -n "$INTERFACE" ]; then
-    echo "$INTERFACE"
+  if [ -n "$INTERFACE" ] && [ "$INTERFACE" != "auto" ]; then
+    printf '%s\n' "$INTERFACE"
   else
     detect_interface
   fi
@@ -250,100 +278,109 @@ current_cycle_id() {
 }
 
 # ── state file ─────────────────────────────────────────────────────
-# state keys (shell-sourceable):
+# state keys (parsed as data, never executed):
 # CYCLE_ID=2026-07
 # BASE_RX=... BASE_TX=...
 # LAST_RX=... LAST_TX=...
 # ACC_RX=0 ACC_TX=0   # extra accumulated across counter resets
+# OFFSET_RX=0 OFFSET_TX=0   # current-cycle manual calibration
 # FIRED_rule-name=1
 
 state_init_defaults() {
   CYCLE_ID=""
+  STATE_IFACE=""
   BASE_RX=0
   BASE_TX=0
   LAST_RX=0
   LAST_TX=0
   ACC_RX=0
   ACC_TX=0
+  OFFSET_RX=0
+  OFFSET_TX=0
 }
 
 load_state() {
   state_init_defaults
-  ensure_dirs
+  ensure_dirs || return 1
   if [ -f "$VTM_STATE" ]; then
-    # shellcheck disable=SC1090
-    source "$VTM_STATE" 2>/dev/null || true
+    local line key val
+    while IFS= read -r line; do
+      [[ "$line" == *=* ]] || continue
+      key=${line%%=*}
+      val=$(conf_parse_value "$line")
+      case "$key" in
+        CYCLE_ID) [[ "$val" =~ ^[0-9]{4}-[0-9]{2}$ ]] && CYCLE_ID=$val ;;
+        STATE_IFACE) [[ "$val" =~ ^[A-Za-z0-9_.:-]*$ ]] && STATE_IFACE=$val ;;
+        BASE_RX|BASE_TX|LAST_RX|LAST_TX|ACC_RX|ACC_TX)
+          if [[ "$val" =~ ^[0-9]+([.][0-9]+)?([eE][+-]?[0-9]+)?$ ]]; then
+            val=$(awk -v n="$val" 'BEGIN{printf "%.0f", n}')
+            printf -v "$key" '%s' "$val"
+          fi
+          ;;
+        OFFSET_RX|OFFSET_TX)
+          [[ "$val" =~ ^-?[0-9]+$ ]] && printf -v "$key" '%s' "$val"
+          ;;
+      esac
+    done <"$VTM_STATE"
   fi
-  BASE_RX=${BASE_RX:-0}
-  BASE_TX=${BASE_TX:-0}
-  LAST_RX=${LAST_RX:-0}
-  LAST_TX=${LAST_TX:-0}
-  ACC_RX=${ACC_RX:-0}
-  ACC_TX=${ACC_TX:-0}
 }
 
 save_state() {
-  ensure_dirs
-  local tmp fired_lines=""
+  ensure_dirs || return 1
+  local preserve_fired="${1:-1}" tmp
   tmp="${VTM_STATE}.tmp.$$"
   {
     echo "# vps-traffic-monitor state — do not edit while running"
     echo "CYCLE_ID='${CYCLE_ID}'"
+    echo "STATE_IFACE='${STATE_IFACE}'"
     echo "BASE_RX=${BASE_RX}"
     echo "BASE_TX=${BASE_TX}"
     echo "LAST_RX=${LAST_RX}"
     echo "LAST_TX=${LAST_TX}"
     echo "ACC_RX=${ACC_RX}"
     echo "ACC_TX=${ACC_TX}"
-    # preserve FIRED_* from current environment
-    if [ -f "$VTM_STATE" ]; then
+    echo "OFFSET_RX=${OFFSET_RX}"
+    echo "OFFSET_TX=${OFFSET_TX}"
+    if [ "$preserve_fired" = "1" ] && [ -f "$VTM_STATE" ]; then
       grep -E '^FIRED_[A-Za-z0-9_.=-]+=' "$VTM_STATE" 2>/dev/null || true
     fi
   } >"$tmp"
-  # re-write FIRED from memory map if we set VTM_FIRED_LIST
-  if [ -n "${VTM_FIRED_EXPORT:-}" ]; then
-    {
-      echo "# vps-traffic-monitor state — do not edit while running"
-      echo "CYCLE_ID='${CYCLE_ID}'"
-      echo "BASE_RX=${BASE_RX}"
-      echo "BASE_TX=${BASE_TX}"
-      echo "LAST_RX=${LAST_RX}"
-      echo "LAST_TX=${LAST_TX}"
-      echo "ACC_RX=${ACC_RX}"
-      echo "ACC_TX=${ACC_TX}"
-      echo "$VTM_FIRED_EXPORT"
-    } >"$tmp"
-  fi
+  chmod 600 "$tmp" 2>/dev/null || true
   mv -f "$tmp" "$VTM_STATE"
+  chmod 600 "$VTM_STATE" 2>/dev/null || true
 }
 
 mark_fired() {
   local name="$1"
   local safe tmp
-  safe=$(echo "$name" | sed 's/[^A-Za-z0-9_]/_/g')
-  ensure_dirs
+  safe=${name//[^A-Za-z0-9_]/_}
+  ensure_dirs || return 1
   tmp="${VTM_STATE}.tmp.$$"
   if [ -f "$VTM_STATE" ]; then
     grep -v "^FIRED_${safe}=" "$VTM_STATE" >"$tmp" 2>/dev/null || true
   else
     {
       echo "CYCLE_ID='${CYCLE_ID}'"
+      echo "STATE_IFACE='${STATE_IFACE:-}'"
       echo "BASE_RX=${BASE_RX:-0}"
       echo "BASE_TX=${BASE_TX:-0}"
       echo "LAST_RX=${LAST_RX:-0}"
       echo "LAST_TX=${LAST_TX:-0}"
       echo "ACC_RX=${ACC_RX:-0}"
       echo "ACC_TX=${ACC_TX:-0}"
+      echo "OFFSET_RX=${OFFSET_RX:-0}"
+      echo "OFFSET_TX=${OFFSET_TX:-0}"
     } >"$tmp"
   fi
   echo "FIRED_${safe}=1" >>"$tmp"
+  chmod 600 "$tmp" 2>/dev/null || true
   mv -f "$tmp" "$VTM_STATE"
 }
 
 is_fired() {
   local name="$1"
   local safe
-  safe=$(echo "$name" | sed 's/[^A-Za-z0-9_]/_/g')
+  safe=${name//[^A-Za-z0-9_]/_}
   [ -f "$VTM_STATE" ] && grep -q "^FIRED_${safe}=1" "$VTM_STATE" 2>/dev/null
 }
 
@@ -351,6 +388,7 @@ clear_fired() {
   if [ -f "$VTM_STATE" ]; then
     local tmp="${VTM_STATE}.tmp.$$"
     grep -v '^FIRED_' "$VTM_STATE" >"$tmp" 2>/dev/null || true
+    chmod 600 "$tmp" 2>/dev/null || true
     mv -f "$tmp" "$VTM_STATE"
   fi
 }
@@ -358,55 +396,111 @@ clear_fired() {
 # update counters, handle cycle reset & reboot; sets globals:
 # RX_USED TX_USED SUM_USED BILL_USED IFACE_NOW
 refresh_usage() {
-  local iface rx tx cur_cycle
-  iface=$(get_iface)
+  local iface counters rx tx cur_cycle interface_changed=0
+  if ! iface=$(get_iface); then
+    err "没有找到可监控的网络接口"
+    log "counter read failed: no interface"
+    return 1
+  fi
   IFACE_NOW="$iface"
-  read -r rx tx <<<"$(read_counters "$iface")"
-  rx=${rx:-0}
-  tx=${tx:-0}
+  if ! counters=$(read_counters "$iface"); then
+    err "读取网卡计数器失败: $iface"
+    log "counter read failed: iface=$iface"
+    return 1
+  fi
+  read -r rx tx <<<"$counters"
 
-  load_state
+  load_state || return 1
   cur_cycle=$(current_cycle_id)
+  [ -n "$cur_cycle" ] || {
+    err "无法计算当前流量周期"
+    log "cycle calculation failed"
+    return 1
+  }
 
   if [ -z "$CYCLE_ID" ] || [ "$CYCLE_ID" != "$cur_cycle" ]; then
     CYCLE_ID="$cur_cycle"
+    STATE_IFACE="$iface"
     BASE_RX=$rx
     BASE_TX=$tx
     LAST_RX=$rx
     LAST_TX=$tx
     ACC_RX=0
     ACC_TX=0
-    save_state
-    clear_fired
-    # re-save cycle after clear
-    CYCLE_ID="$cur_cycle"
+    OFFSET_RX=0
+    OFFSET_TX=0
+    save_state 0 || return 1
+  elif [ -z "$STATE_IFACE" ]; then
+    STATE_IFACE="$iface"
+  elif [ "$STATE_IFACE" != "$iface" ]; then
+    ACC_RX=$(awk -v a="$ACC_RX" -v l="$LAST_RX" -v b="$BASE_RX" 'BEGIN{v=l-b; if(v<0)v=0; printf "%.0f", a+v}')
+    ACC_TX=$(awk -v a="$ACC_TX" -v l="$LAST_TX" -v b="$BASE_TX" 'BEGIN{v=l-b; if(v<0)v=0; printf "%.0f", a+v}')
+    STATE_IFACE="$iface"
     BASE_RX=$rx
     BASE_TX=$tx
     LAST_RX=$rx
     LAST_TX=$tx
-    ACC_RX=0
-    ACC_TX=0
-    save_state
+    interface_changed=1
+    log "monitor interface changed to $iface"
   fi
 
   # counter reboot / wrap: current < last
-  if [ "$(awk -v a="$rx" -v b="$LAST_RX" 'BEGIN{print (a+0 < b+0) ? 1 : 0}')" -eq 1 ]; then
-    ACC_RX=$(awk -v a="$ACC_RX" -v l="$LAST_RX" -v b="$BASE_RX" 'BEGIN{print a + (l - b)}')
+  if [ "$interface_changed" -eq 0 ] && [ "$(awk -v a="$rx" -v b="$LAST_RX" 'BEGIN{print (a+0 < b+0) ? 1 : 0}')" -eq 1 ]; then
+    ACC_RX=$(awk -v a="$ACC_RX" -v l="$LAST_RX" -v b="$BASE_RX" 'BEGIN{v=l-b; if(v<0)v=0; printf "%.0f", a+v}')
     BASE_RX=0
   fi
-  if [ "$(awk -v a="$tx" -v b="$LAST_TX" 'BEGIN{print (a+0 < b+0) ? 1 : 0}')" -eq 1 ]; then
-    ACC_TX=$(awk -v a="$ACC_TX" -v l="$LAST_TX" -v b="$BASE_TX" 'BEGIN{print a + (l - b)}')
+  if [ "$interface_changed" -eq 0 ] && [ "$(awk -v a="$tx" -v b="$LAST_TX" 'BEGIN{print (a+0 < b+0) ? 1 : 0}')" -eq 1 ]; then
+    ACC_TX=$(awk -v a="$ACC_TX" -v l="$LAST_TX" -v b="$BASE_TX" 'BEGIN{v=l-b; if(v<0)v=0; printf "%.0f", a+v}')
     BASE_TX=0
   fi
 
   LAST_RX=$rx
   LAST_TX=$tx
-  save_state
+  save_state || return 1
 
-  RX_USED=$(awk -v a="$ACC_RX" -v r="$rx" -v b="$BASE_RX" 'BEGIN{v=a+(r-b); if(v<0)v=0; printf "%.0f", v}')
-  TX_USED=$(awk -v a="$ACC_TX" -v t="$tx" -v b="$BASE_TX" 'BEGIN{v=a+(t-b); if(v<0)v=0; printf "%.0f", v}')
+  RAW_RX_USED=$(awk -v a="$ACC_RX" -v r="$rx" -v b="$BASE_RX" 'BEGIN{v=a+(r-b); if(v<0)v=0; printf "%.0f", v}')
+  RAW_TX_USED=$(awk -v a="$ACC_TX" -v t="$tx" -v b="$BASE_TX" 'BEGIN{v=a+(t-b); if(v<0)v=0; printf "%.0f", v}')
+  RX_USED=$(awk -v r="$RAW_RX_USED" -v o="$OFFSET_RX" 'BEGIN{v=r+o; if(v<0)v=0; printf "%.0f", v}')
+  TX_USED=$(awk -v t="$RAW_TX_USED" -v o="$OFFSET_TX" 'BEGIN{v=t+o; if(v<0)v=0; printf "%.0f", v}')
   SUM_USED=$(awk -v r="$RX_USED" -v t="$TX_USED" 'BEGIN{printf "%.0f", r+t}')
   BILL_USED=$(compute_metric_value "$METRIC" "$RX_USED" "$TX_USED")
+}
+
+calibrate_usage() {
+  local direction="$1" target_text="$2" target raw offset rc=0
+  if ! target=$(parse_size "$target_text"); then
+    err "流量格式无效: $target_text"
+    return 1
+  fi
+  case "$direction" in
+    up|tx) direction=up ;;
+    down|rx) direction=down ;;
+    *) err "校准方向只支持 up 或 down"; return 1 ;;
+  esac
+
+  acquire_lock || return 1
+  if ! refresh_usage; then
+    release_lock
+    return 1
+  fi
+  if [ "$direction" = "up" ]; then
+    raw=$RAW_TX_USED
+    offset=$(awk -v t="$target" -v r="$raw" 'BEGIN{printf "%.0f", t-r}')
+    OFFSET_TX=$offset
+    TX_USED=$target
+  else
+    raw=$RAW_RX_USED
+    offset=$(awk -v t="$target" -v r="$raw" 'BEGIN{printf "%.0f", t-r}')
+    OFFSET_RX=$offset
+    RX_USED=$target
+  fi
+  SUM_USED=$(awk -v r="$RX_USED" -v t="$TX_USED" 'BEGIN{printf "%.0f", r+t}')
+  BILL_USED=$(compute_metric_value "$METRIC" "$RX_USED" "$TX_USED")
+  save_state || rc=1
+  release_lock
+  [ "$rc" -eq 0 ] || return 1
+  log "usage calibrated direction=$direction target=$target cycle=$CYCLE_ID"
+  ok "已校准本周期${direction}: $(bytes_to_human "$target")"
 }
 
 compute_metric_value() {
@@ -474,7 +568,7 @@ EOF
 }
 
 write_default_config() {
-  ensure_dirs
+  ensure_dirs || return 1
   if [ ! -f "$VTM_CONFIG" ]; then
     default_config_body >"$VTM_CONFIG"
     # set instance default
@@ -483,6 +577,7 @@ write_default_config() {
     sed -i "s/^INSTANCE_NAME=\"\"/INSTANCE_NAME=\"$hn\"/" "$VTM_CONFIG" 2>/dev/null || true
     ok "已生成默认配置: $VTM_CONFIG"
   fi
+  chmod 600 "$VTM_CONFIG" 2>/dev/null || true
 }
 
 # Read KEY=value or KEY="value" from conf line (value may contain | , : etc.)
@@ -494,6 +589,7 @@ conf_parse_value() {
   if [[ "$val" == \"*\" ]]; then
     val="${val:1:${#val}-2}"
     val="${val//\\\"/\"}"
+    val="${val//\\\\/\\}"
   elif [[ "$val" == \'*\' ]]; then
     val="${val:1:${#val}-2}"
   fi
@@ -503,34 +599,57 @@ conf_parse_value() {
 load_config() {
   RULE_LINES=()
   CMD_MAP=()
-  write_default_config
+  write_default_config || return 1
 
-  # Source only safe scalar keys (no RULE_/CMD_ — values may contain | )
-  local tmp_src
-  tmp_src=$(mktemp)
-  grep -E '^(INSTANCE_NAME|INTERFACE|METRIC|RESET_DAY|TIMEZONE|QUOTA|TG_|MAIL_|SHUTDOWN_|ADDRESS_|DRY_RUN|CHECK_INTERVAL|MENU_KEY)' \
-    "$VTM_CONFIG" 2>/dev/null | grep -vE '^\s*#' >"$tmp_src" || true
-  # shellcheck disable=SC1090
-  source "$tmp_src" 2>/dev/null || true
-  rm -f "$tmp_src"
-
-  INSTANCE_NAME=${INSTANCE_NAME:-$(hostname 2>/dev/null || echo vps)}
-  METRIC=${METRIC:-up}
-  RESET_DAY=${RESET_DAY:-1}
-  TIMEZONE=${TIMEZONE:-Asia/Shanghai}
-  TG_ENABLED=${TG_ENABLED:-0}
-  MAIL_ENABLED=${MAIL_ENABLED:-0}
-  MAIL_PORT=${MAIL_PORT:-465}
-  MAIL_USE_SSL=${MAIL_USE_SSL:-1}
-  SHUTDOWN_ENABLED=${SHUTDOWN_ENABLED:-1}
-  SHUTDOWN_DELAY=${SHUTDOWN_DELAY:-30}
-  ADDRESS_STOP_CMD=${ADDRESS_STOP_CMD:-/root/address/app/ops/stop.sh}
-  DRY_RUN=${DRY_RUN:-0}
-  CHECK_INTERVAL_MIN=${CHECK_INTERVAL_MIN:-5}
-  MENU_KEY=${MENU_KEY:-m}
-  TG_ENDPOINT=${TG_ENDPOINT:-https://api.telegram.org/bot}
+  INSTANCE_NAME="$(hostname 2>/dev/null || echo vps)"
+  INTERFACE=""
+  METRIC="up"
+  RESET_DAY=1
+  TIMEZONE="Asia/Shanghai"
+  QUOTA=""
+  TG_ENABLED=0
+  TG_BOT_TOKEN=""
+  TG_CHAT_ID=""
+  TG_ENDPOINT="https://api.telegram.org/bot"
+  MAIL_ENABLED=0
+  MAIL_HOST=""
+  MAIL_PORT=465
+  MAIL_USE_SSL=1
+  MAIL_USER=""
+  MAIL_PASS=""
+  MAIL_FROM=""
+  MAIL_TO=""
+  SHUTDOWN_ENABLED=1
+  SHUTDOWN_CMD="/sbin/shutdown -h now"
+  SHUTDOWN_DELAY=30
+  ADDRESS_STOP_CMD="/root/address/app/ops/stop.sh"
+  DRY_RUN=0
+  CHECK_INTERVAL_MIN=5
+  MENU_KEY="m"
 
   local line key val name
+  while IFS= read -r line; do
+    [[ "$line" == *=* ]] || continue
+    key=${line%%=*}
+    case "$key" in
+      INSTANCE_NAME|INTERFACE|METRIC|RESET_DAY|TIMEZONE|QUOTA|TG_ENABLED|TG_BOT_TOKEN|TG_CHAT_ID|TG_ENDPOINT|MAIL_ENABLED|MAIL_HOST|MAIL_PORT|MAIL_USE_SSL|MAIL_USER|MAIL_PASS|MAIL_FROM|MAIL_TO|SHUTDOWN_ENABLED|SHUTDOWN_CMD|SHUTDOWN_DELAY|ADDRESS_STOP_CMD|DRY_RUN|CHECK_INTERVAL_MIN|MENU_KEY)
+        val=$(conf_parse_value "$line")
+        printf -v "$key" '%s' "$val"
+        ;;
+    esac
+  done <"$VTM_CONFIG"
+
+  case "$METRIC" in up|tx|upload|out|down|rx|download|in|sum|total|min|max) ;; *) METRIC=up ;; esac
+  [[ "$RESET_DAY" =~ ^[0-9]+$ ]] && [ "$RESET_DAY" -ge 1 ] && [ "$RESET_DAY" -le 28 ] || RESET_DAY=1
+  [[ "$MAIL_PORT" =~ ^[0-9]+$ ]] || MAIL_PORT=465
+  [[ "$SHUTDOWN_DELAY" =~ ^[0-9]+$ ]] || SHUTDOWN_DELAY=30
+  [[ "$CHECK_INTERVAL_MIN" =~ ^[0-9]+$ ]] && [ "$CHECK_INTERVAL_MIN" -ge 1 ] || CHECK_INTERVAL_MIN=5
+  [[ "$TG_ENABLED" =~ ^[01]$ ]] || TG_ENABLED=0
+  [[ "$MAIL_ENABLED" =~ ^[01]$ ]] || MAIL_ENABLED=0
+  [[ "$MAIL_USE_SSL" =~ ^[01]$ ]] || MAIL_USE_SSL=1
+  [[ "$SHUTDOWN_ENABLED" =~ ^[01]$ ]] || SHUTDOWN_ENABLED=1
+  [[ "$DRY_RUN" =~ ^[01]$ ]] || DRY_RUN=0
+
   while IFS= read -r line; do
     [ -z "$line" ] && continue
     val=$(conf_parse_value "$line")
@@ -548,7 +667,8 @@ load_config() {
 
 set_config_kv() {
   local key="$1" val="$2"
-  ensure_dirs
+  [[ "$key" =~ ^[A-Z][A-Z0-9_]*$ ]] || return 1
+  ensure_dirs || return 1
   [ -f "$VTM_CONFIG" ] || write_default_config
   local tmp esc
   tmp="${VTM_CONFIG}.tmp.$$"
@@ -561,7 +681,9 @@ set_config_kv() {
     cp "$VTM_CONFIG" "$tmp"
     echo "${key}=\"${esc}\"" >>"$tmp"
   fi
+  chmod 600 "$tmp" 2>/dev/null || true
   mv -f "$tmp" "$VTM_CONFIG"
+  chmod 600 "$VTM_CONFIG" 2>/dev/null || true
 }
 
 # rewrite all RULE_* from RULE_LINES array
@@ -578,7 +700,9 @@ save_rules() {
     echo "RULE_${i}=\"${esc}\"" >>"$tmp"
     i=$((i + 1))
   done
+  chmod 600 "$tmp" 2>/dev/null || true
   mv -f "$tmp" "$VTM_CONFIG"
+  chmod 600 "$VTM_CONFIG" 2>/dev/null || true
 }
 
 save_cmd() {
@@ -591,7 +715,9 @@ delete_cmd() {
   local tmp
   tmp="${VTM_CONFIG}.tmp.$$"
   grep -vE "^CMD_${name}=" "$VTM_CONFIG" >"$tmp" 2>/dev/null || true
+  chmod 600 "$tmp" 2>/dev/null || true
   mv -f "$tmp" "$VTM_CONFIG"
+  chmod 600 "$VTM_CONFIG" 2>/dev/null || true
 }
 
 # ── notify ─────────────────────────────────────────────────────────
@@ -613,13 +739,12 @@ notify_telegram() {
     return 1
   }
   local text url resp
-  text=$(printf '<b>%s</b>\n%s' "$title" "$body")
+  text=$(printf '%s\n%s' "$title" "$body")
   url="${TG_ENDPOINT:-https://api.telegram.org/bot}${TG_BOT_TOKEN}/sendMessage"
   resp=$(curl -fsSL --connect-timeout 10 --max-time 30 \
-    -d "chat_id=${TG_CHAT_ID}" \
+    --data-urlencode "chat_id=${TG_CHAT_ID}" \
     --data-urlencode "text=${text}" \
-    -d "parse_mode=HTML" \
-    "$url" 2>&1) || {
+    "$url" 9>&- 2>&1) || {
     log "telegram fail: $resp"
     err "Telegram 请求失败: $resp"
     return 1
@@ -677,7 +802,7 @@ notify_email() {
     fi
 
     local cerr
-    if cerr=$(curl "${curl_args[@]}" 2>&1); then
+    if cerr=$(curl "${curl_args[@]}" 9>&- 2>&1); then
       rm -f "$mailfile"
       return 0
     fi
@@ -694,7 +819,7 @@ notify_email() {
       echo "Content-Type: text/plain; charset=UTF-8"
       echo ""
       echo "$body"
-    } | sendmail -t 2>>"$VTM_LOG"; then
+    } | sendmail -t 9>&- 2>>"$VTM_LOG"; then
       return 0
     fi
   fi
@@ -733,27 +858,29 @@ test_email() {
 
 send_notify() {
   local title="$1" body="$2"
-  local ok_any=0
+  local configured=0 failed=0
   local lines=()
 
   if [ "$TG_ENABLED" = "1" ]; then
+    configured=$((configured + 1))
     if notify_telegram "$title" "$body"; then
       lines+=("Telegram: ok")
-      ok_any=1
     else
       lines+=("Telegram: fail")
+      failed=$((failed + 1))
     fi
   fi
   if [ "$MAIL_ENABLED" = "1" ]; then
+    configured=$((configured + 1))
     if notify_email "$title" "$body"; then
       lines+=("Email: ok")
-      ok_any=1
     else
       lines+=("Email: fail")
+      failed=$((failed + 1))
     fi
   fi
 
-  if [ "$TG_ENABLED" != "1" ] && [ "$MAIL_ENABLED" != "1" ]; then
+  if [ "$configured" -eq 0 ]; then
     warn "未启用任何通知通道"
     log "notify skipped: no channel"
     return 1
@@ -764,16 +891,18 @@ send_notify() {
     echo "  $l"
     log "notify $l | $title"
   done
-  [ "$ok_any" -eq 1 ]
+  [ "$failed" -eq 0 ]
 }
 
-build_status_text() {
-  refresh_usage
+format_status_text() {
   local qbytes="" qh="(未设配额)" pct="n/a"
   if [ -n "$QUOTA" ]; then
-    qbytes=$(parse_size "$QUOTA")
-    qh=$(bytes_to_human "$qbytes")
-    pct=$(pct_of "$BILL_USED" "$qbytes")
+    if qbytes=$(parse_size "$QUOTA"); then
+      qh=$(bytes_to_human "$qbytes")
+      pct=$(pct_of "$BILL_USED" "$qbytes")
+    else
+      qh="配置无效"
+    fi
   fi
   local hn ip
   hn=$(hostname 2>/dev/null || echo unknown)
@@ -793,6 +922,15 @@ IP: ${ip:-n/a}
 EOF
 }
 
+build_status_text() {
+  local rc=0
+  acquire_lock || return 1
+  refresh_usage || rc=1
+  release_lock
+  [ "$rc" -eq 0 ] || return 1
+  format_status_text
+}
+
 # ── actions ────────────────────────────────────────────────────────
 run_named_cmd() {
   local name="$1"
@@ -809,8 +947,7 @@ run_named_cmd() {
   fi
   info "执行命令 [$name]: $cmd"
   log "run cmd $name: $cmd"
-  # shellcheck disable=SC2086
-  bash -c "$cmd"
+  bash -c "$cmd" 9>&-
 }
 
 do_shutdown() {
@@ -826,33 +963,24 @@ do_shutdown() {
   warn "将在 ${SHUTDOWN_DELAY} 秒后关机: $SHUTDOWN_CMD"
   log "shutdown in ${SHUTDOWN_DELAY}s"
   sleep "$SHUTDOWN_DELAY"
-  # shellcheck disable=SC2086
-  bash -c "$SHUTDOWN_CMD"
+  bash -c "$SHUTDOWN_CMD" 9>&-
 }
 
 execute_actions() {
   local actions_csv="$1" rule_name="$2" detail="$3"
   local title body
   title="⚠️ 流量阈值触发: ${rule_name}"
-  body=$(printf '%s\n规则: %s\n详情: %s\n' "$(build_status_text)" "$rule_name" "$detail")
+  body=$(printf '%s\n规则: %s\n详情: %s\n' "$(format_status_text)" "$rule_name" "$detail")
 
-  local a has_notify=0
+  local a
   IFS=',' read -ra _acts <<<"$actions_csv"
-  for a in "${_acts[@]}"; do
-    a=$(echo "$a" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-    case "$a" in
-      notify) has_notify=1 ;;
-    esac
-  done
-
-  # notify first if requested
-  if [ "$has_notify" -eq 1 ]; then
-    if [ "$DRY_RUN" = "1" ]; then
-      warn "[dry-run] 发送通知: $title"
-      log "dry-run notify $rule_name"
-    else
-      send_notify "$title" "$body" || warn "通知发送部分失败"
-    fi
+  if [ "$DRY_RUN" = "1" ]; then
+    warn "[dry-run] 发送通知: $title"
+    log "dry-run notify $rule_name"
+  elif ! send_notify "$title" "$body"; then
+    warn "通知未全部送达，本轮不执行后续动作"
+    log "rule $rule_name blocked by notification failure"
+    return 1
   fi
 
   for a in "${_acts[@]}"; do
@@ -860,23 +988,19 @@ execute_actions() {
     case "$a" in
       notify) ;;
       stop_address|stop-address)
-        do_stop_address
+        do_stop_address || return 1
         ;;
       shutdown)
-        if [ "$has_notify" -ne 1 ]; then
-          if [ "$DRY_RUN" = "1" ]; then
-            warn "[dry-run] 关机前通知: $title"
-          else
-            send_notify "🛑 即将关机: ${rule_name}" "$body" || true
-          fi
-        fi
-        do_shutdown
+        do_shutdown || return 1
         ;;
       run:*)
-        run_named_cmd "${a#run:}"
+        run_named_cmd "${a#run:}" || return 1
         ;;
+      "") ;;
       *)
         warn "未知动作: $a"
+        log "unknown action $a in rule $rule_name"
+        return 1
         ;;
     esac
   done
@@ -896,7 +1020,7 @@ do_stop_address() {
   fi
   info "停止 address: $cmd"
   log "stop_address: $cmd"
-  bash "$cmd"
+  bash "$cmd" 9>&-
 }
 
 # 把 actions 列表显示成中文
@@ -918,10 +1042,15 @@ actions_label() {
 # ── rules engine ───────────────────────────────────────────────────
 # RULE line: name|threshold|metric|actions
 check_rules() {
-  load_config
-  refresh_usage
+  load_config || return 1
+  acquire_lock || return 1
+  if ! refresh_usage; then
+    release_lock
+    return 1
+  fi
   local line name th m acts th_bytes used
-  local triggered=0
+  local triggered=0 rc=0 rule_key
+  local -A seen_rule_keys=()
   for line in "${RULE_LINES[@]}"; do
     IFS='|' read -r name th m acts <<<"$line"
     name=$(echo "$name" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
@@ -929,7 +1058,35 @@ check_rules() {
     m=$(echo "${m:-$METRIC}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
     acts=$(echo "$acts" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
     [ -z "$name" ] && continue
-    th_bytes=$(parse_size "$th")
+    if [[ ! "$name" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+      err "规则名称无效: $name"
+      log "invalid rule name=$name"
+      rc=1
+      continue
+    fi
+    rule_key=${name//[^A-Za-z0-9_]/_}
+    if [ -n "${seen_rule_keys[$rule_key]:-}" ]; then
+      err "规则名称冲突: $name"
+      log "duplicate rule state key=$rule_key name=$name"
+      rc=1
+      continue
+    fi
+    seen_rule_keys[$rule_key]=1
+    case "$m" in
+      up|tx|upload|out|down|rx|download|in|sum|total|min|max) ;;
+      *)
+        err "规则计量方向无效: $name ($m)"
+        log "invalid metric rule=$name value=$m"
+        rc=1
+        continue
+        ;;
+    esac
+    if ! th_bytes=$(parse_size "$th") || [ "$th_bytes" = "0" ]; then
+      err "规则阈值无效: $name ($th)"
+      log "invalid threshold rule=$name value=$th"
+      rc=1
+      continue
+    fi
     used=$(compute_metric_value "$m" "$RX_USED" "$TX_USED")
     if [ "$(awk -v u="$used" -v t="$th_bytes" 'BEGIN{print (u+0 >= t+0) ? 1 : 0}')" -eq 1 ]; then
       if is_fired "$name"; then
@@ -938,14 +1095,21 @@ check_rules() {
       fi
       info "触发规则: $name ($(bytes_to_human "$used") >= $th)"
       log "trigger $name used=$used threshold=$th_bytes"
-      execute_actions "$acts" "$name" "$(metric_label "$m") $(bytes_to_human "$used") >= $th"
-      mark_fired "$name"
+      if execute_actions "$acts" "$name" "$(metric_label "$m") $(bytes_to_human "$used") >= $th"; then
+        if [ "$DRY_RUN" != "1" ]; then
+          mark_fired "$name" || rc=1
+        fi
+      else
+        rc=1
+      fi
       triggered=1
     fi
   done
   if [ "$triggered" -eq 0 ]; then
     log "check ok bill=$(bytes_to_human "$BILL_USED") cycle=$CYCLE_ID"
   fi
+  release_lock
+  return "$rc"
 }
 
 # ── install / systemd ──────────────────────────────────────────────
@@ -1180,12 +1344,14 @@ install_timer() {
   cat >"$VTM_UNIT_DIR/$VTM_SERVICE" <<EOF
 [Unit]
 Description=VPS Traffic Monitor one-shot check
+Wants=network-online.target
 After=network-online.target
 
 [Service]
 Type=oneshot
 ExecStart=$VTM_SCRIPT_PATH --check
 Nice=10
+UMask=0077
 EOF
 
   cat >"$VTM_UNIT_DIR/$VTM_TIMER" <<EOF
@@ -1194,7 +1360,7 @@ Description=VPS Traffic Monitor periodic check
 
 [Timer]
 OnBootSec=2min
-OnUnitActiveSec=${mins}min
+OnUnitInactiveSec=${mins}min
 AccuracySec=30s
 Unit=$VTM_SERVICE
 
@@ -1202,8 +1368,9 @@ Unit=$VTM_SERVICE
 WantedBy=timers.target
 EOF
 
-  systemctl daemon-reload
-  systemctl enable --now "$VTM_TIMER"
+  systemctl daemon-reload || return 1
+  systemctl enable "$VTM_TIMER" || return 1
+  systemctl restart "$VTM_TIMER" || return 1
   ok "已安装并启动 timer (每 ${mins} 分钟)"
   systemctl status "$VTM_TIMER" --no-pager -l | head -15 || true
 }
@@ -1236,7 +1403,13 @@ service_mark() {
 
 show_dashboard() {
   load_config
-  refresh_usage 2>/dev/null || true
+  local usage_ok=1
+  if acquire_lock; then
+    refresh_usage || usage_ok=0
+    release_lock
+  else
+    usage_ok=0
+  fi
 
   local tg_s mail_s timer_s
   if [ "$TG_ENABLED" = "1" ] && [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
@@ -1257,9 +1430,13 @@ show_dashboard() {
   echo -e "快捷键: 输入 ${gl_lv}${MENU_KEY:-m}${gl_bai} 回车（PATH 命令，类似 kejilion 的 k）"
   echo "------------------------"
   echo -e "${gl_kjlan}【本月流量】${gl_bai}"
-  echo "  上行: $(bytes_to_human "${TX_USED:-0}")"
-  echo "  下行: $(bytes_to_human "${RX_USED:-0}")"
-  echo "  合计: $(bytes_to_human "${SUM_USED:-0}")"
+  if [ "$usage_ok" -eq 1 ]; then
+    echo "  上行: $(bytes_to_human "${TX_USED:-0}")"
+    echo "  下行: $(bytes_to_human "${RX_USED:-0}")"
+    echo "  合计: $(bytes_to_human "${SUM_USED:-0}")"
+  else
+    echo -e "  ${gl_hong}读取失败，请检查 INTERFACE 和日志${gl_bai}"
+  fi
   echo "------------------------"
   echo -e "${gl_kjlan}【通知】${gl_bai} Telegram:${tg_s}  邮件:${mail_s}"
   echo -e "${gl_kjlan}【后台监控】${gl_bai} ${timer_s}"
@@ -1272,8 +1449,17 @@ show_dashboard() {
     for line in "${RULE_LINES[@]}"; do
       IFS='|' read -r name th m acts <<<"$line"
       m=${m:-up}
+      if [ "$usage_ok" -ne 1 ]; then
+        echo -e "  ${i}. ${name}  $(metric_label "$m") ≥ ${th}  → $(actions_label "$acts")  ${gl_hong}[数据错误]${gl_bai}"
+        i=$((i + 1))
+        continue
+      fi
       used=$(compute_metric_value "$m" "${RX_USED:-0}" "${TX_USED:-0}")
-      thb=$(parse_size "$th")
+      if ! thb=$(parse_size "$th"); then
+        echo -e "  ${i}. ${name}  ${gl_hong}阈值无效: ${th}${gl_bai}"
+        i=$((i + 1))
+        continue
+      fi
       if is_fired "$name"; then
         flag="${gl_huang}[已触发]${gl_bai}"
       elif [ "$(awk -v u="$used" -v t="$thb" 'BEGIN{print (u+0>=t+0)?1:0}')" -eq 1 ]; then
@@ -1292,6 +1478,7 @@ show_dashboard() {
   echo -e "${gl_lv}4.${gl_bai} 后台监控开关（开机自动检查）"
   echo -e "${gl_lv}5.${gl_bai} 改快捷键（当前: ${MENU_KEY:-m}）"
   echo -e "${gl_lv}6.${gl_bai} 更新脚本"
+  echo -e "${gl_lv}7.${gl_bai} 校准本周期已用流量"
   echo -e "${gl_lv}0.${gl_bai} 退出"
   echo "------------------------"
 }
@@ -1308,10 +1495,25 @@ wizard_add_rule() {
   echo -e "${gl_hui}触发时一定发通知；停 address、关机可都不选、选一个或两个都选${gl_bai}"
   echo "------------------------"
 
-  local name dir m th act_stop act_off acts
+  local name dir m th th_bytes act_stop act_off acts
   read -r -p "1) 规则名称 (如 stop-at-6.5t): " name
-  if [ -z "$name" ]; then err "名称不能为空"; press_any; return 1; fi
   name=$(echo "$name" | tr -d '[:space:]')
+  if [[ ! "$name" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+    err "名称仅支持字母、数字、点、下划线和连字符"
+    press_any
+    return 1
+  fi
+  local existing existing_name existing_key name_key
+  name_key=${name//[^A-Za-z0-9_]/_}
+  for existing in "${RULE_LINES[@]}"; do
+    existing_name=${existing%%|*}
+    existing_key=${existing_name//[^A-Za-z0-9_]/_}
+    if [ "$existing_key" = "$name_key" ]; then
+      err "规则名称与现有规则冲突: $existing_name"
+      press_any
+      return 1
+    fi
+  done
 
   echo ""
   echo "2) 统计哪边的流量?"
@@ -1330,7 +1532,7 @@ wizard_add_rule() {
   echo ""
   read -r -p "3) 达到多少流量触发? (如 6.5T / 800G / 100M): " th
   if [ -z "$th" ]; then err "阈值不能为空"; press_any; return 1; fi
-  if [ "$(parse_size "$th")" = "0" ]; then err "阈值格式无效"; press_any; return 1; fi
+  if ! th_bytes=$(parse_size "$th") || [ "$th_bytes" = "0" ]; then err "阈值格式无效"; press_any; return 1; fi
 
   echo ""
   echo "4) 额外动作（通知一定会发）"
@@ -1360,6 +1562,36 @@ wizard_add_rule() {
   RULE_LINES+=("${name}|${th}|${m}|${acts}")
   save_rules
   ok "已添加规则: $name"
+  press_any
+}
+
+menu_calibrate_usage() {
+  load_config || return 1
+  clear 2>/dev/null || true
+  echo -e "${gl_kjlan}校准本周期已用流量${gl_bai}"
+  echo "------------------------"
+  build_status_text || { press_any; return 1; }
+  echo "------------------------"
+  echo "1. 上行（Oracle 出站）"
+  echo "2. 下行"
+  echo "0. 返回"
+  local choice direction value
+  read -r -p "请选择: " choice
+  case "$choice" in
+    1) direction=up ;;
+    2) direction=down ;;
+    0|"") return ;;
+    *) err "无效选择"; press_any; return 1 ;;
+  esac
+  read -r -p "输入控制台显示的本周期已用流量 (如 4.2T): " value
+  if [ -z "$value" ] || ! parse_size "$value" >/dev/null; then
+    err "流量格式无效"
+    press_any
+    return 1
+  fi
+  if confirm_yes "确认校准 $(metric_label "$direction") 为 $value?"; then
+    calibrate_usage "$direction" "$value"
+  fi
   press_any
 }
 
@@ -1437,7 +1669,7 @@ menu_notify() {
           TG_BOT_TOKEN="$old_token"; TG_CHAT_ID="$old_chat"; TG_ENDPOINT="$old_ep"
           press_any; continue
         fi
-        if test_telegram "VPS 流量监控 · Telegram 测试" "$(build_status_text)"; then
+        if test_telegram "VPS 流量监控 · Telegram 测试"; then
           set_config_kv TG_BOT_TOKEN "$TG_BOT_TOKEN"
           set_config_kv TG_CHAT_ID "$TG_CHAT_ID"
           set_config_kv TG_ENDPOINT "$TG_ENDPOINT"
@@ -1474,7 +1706,7 @@ menu_notify() {
           MAIL_FROM="$old_fr"; MAIL_TO="$old_to"; MAIL_USE_SSL="$old_ssl"
           press_any; continue
         fi
-        if test_email "VPS 流量监控 · 邮件测试" "$(build_status_text)"; then
+        if test_email "VPS 流量监控 · 邮件测试"; then
           set_config_kv MAIL_HOST "$MAIL_HOST"
           set_config_kv MAIL_PORT "$MAIL_PORT"
           set_config_kv MAIL_USER "$MAIL_USER"
@@ -1498,7 +1730,7 @@ menu_notify() {
         local any=0
         if [ "$TG_ENABLED" = "1" ]; then test_telegram && any=1; else warn "Telegram 未开启"; fi
         if [ "$MAIL_ENABLED" = "1" ]; then test_email && any=1; else warn "邮件未开启"; fi
-        [ "$any" -eq 1 ] && ok "测试结束" || err "没有可用通道"
+        if [ "$any" -eq 1 ]; then ok "测试结束"; else err "没有可用通道"; fi
         press_any
         ;;
       6) set_config_kv TG_ENABLED 0; ok "已关闭 Telegram"; press_any ;;
@@ -1591,6 +1823,7 @@ main_menu() {
         fi
         press_any
         ;;
+      7) menu_calibrate_usage ;;
       0)
         echo "bye"
         exit 0
@@ -1620,6 +1853,7 @@ VPS Traffic Monitor v${sh_v}
   $0 --update             从 GitHub 更新脚本
   $0 --install-timer      安装 systemd timer
   $0 --uninstall-timer
+  $0 --set-used up|down SIZE  校准本周期已用流量
   $0 --help
 
 一键运行:
@@ -1628,37 +1862,32 @@ EOF
 }
 
 main() {
-  ensure_dirs
+  ensure_dirs || exit 1
   case "${1:-}" in
     --help|-h) usage; exit 0 ;;
     --check)
-      load_config
       check_rules
-      exit 0
+      exit $?
       ;;
     --status)
-      load_config
+      load_config || exit 1
       build_status_text
-      exit 0
+      exit $?
       ;;
     --test-notify)
-      load_config
-      local rc=1
-      [ "$TG_ENABLED" = "1" ] && test_telegram && rc=0
-      [ "$MAIL_ENABLED" = "1" ] && test_email && rc=0
-      if [ "$TG_ENABLED" != "1" ] && [ "$MAIL_ENABLED" != "1" ]; then
-        err "未启用任何通知通道"
-        exit 1
-      fi
-      exit $rc
+      load_config || exit 1
+      local body
+      body=$(build_status_text) || exit 1
+      send_notify "VPS Traffic Monitor · 通知测试" "$body"
+      exit $?
       ;;
     --test-telegram)
-      load_config
+      load_config || exit 1
       test_telegram
       exit $?
       ;;
     --test-email)
-      load_config
+      load_config || exit 1
       test_email
       exit $?
       ;;
@@ -1678,6 +1907,11 @@ main() {
       uninstall_timer
       exit $?
       ;;
+    --set-used)
+      load_config || exit 1
+      calibrate_usage "${2:-}" "${3:-}"
+      exit $?
+      ;;
     --menu|"")
       main_menu
       ;;
@@ -1689,4 +1923,6 @@ main() {
   esac
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
